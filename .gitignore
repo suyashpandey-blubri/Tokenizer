@@ -1,0 +1,7 @@
+/target
+# Leading slash matters: an unanchored `data/` also matches `tests/data/`, which would
+# exclude the two fixtures that `src/lib.rs` and `tests/api.rs` both `include!`.
+/data/
+/models/
+*.model
+*.vocab
