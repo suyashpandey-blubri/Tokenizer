@@ -85,15 +85,27 @@ def read_pattern(model_path: Path) -> str:
 
 
 def corpus_chunks(text: str) -> list[str]:
-    """The corpus as the trainers want it, losing nothing.
+    """The corpus as ONE string, because any chunking changes what is learned.
 
-    `keepends=True` matters more than it looks. `text.split("\\n")` throws the newlines
-    away, so the comparators would train on a corpus with every line ending deleted
-    while our binary trains on the file as it actually is. That is a different corpus,
-    and it would show up as a fertility difference that has nothing to do with the
-    algorithm.
+    THIS WAS A BUG AND IT PRODUCED A WRONG RESULT. The first version of this function
+    split the corpus into lines. It used `keepends=True`, so no character was lost, and
+    that looked sufficient. It is not.
+
+    A chunk boundary is a merge barrier. BPE can only merge within one item of the
+    iterator, so splitting "a\\n\\nb" into "a\\n" and "\\nb" makes the pair (\\n, \\n)
+    unreachable no matter how often it occurs. Our binary reads the whole file and has
+    no such barrier, so the comparators were training on a subtly different corpus.
+
+    The damage, measured on book.txt @ 2000: we appeared to beat rustbpe by 1.29% on
+    fertility (209,446 tokens against 212,180), and 14 of 1744 learned tokens differed.
+    Every differing token involved a newline run -- we learned "\\n\\n" and ".\\n\\n",
+    rustbpe could only reach ".\\n". Feeding the whole corpus instead makes the two merge
+    lists byte-identical IN ORDER and the token counts equal at 209,446.
+
+    So: one element, no boundaries, exactly what `naive_bbpe train` sees. It is returned
+    as a list rather than yielded because sentencepiece needs to be handed it twice.
     """
-    return text.splitlines(keepends=True)
+    return [text]
 
 
 def write_ranks(path: Path, ranks: list[tuple[bytes, int]]) -> None:
@@ -257,6 +269,11 @@ def train_sp(text: str, vocab_size: int, prefix: Path) -> int:
         hard_vocab_limit=False,          # stop short rather than erroring, as ours does
         # Unused specials would each cost a vocabulary slot. <unk> cannot be disabled.
         unk_id=0, bos_id=-1, eos_id=-1, pad_id=-1,
+        # sentencepiece SILENTLY DROPS any sentence longer than this, and the default is
+        # 4192 bytes. Handed the whole corpus at the default it discards all of it and
+        # fails with an unhelpful "[!sentences_.empty()]". Raised past the corpus size so
+        # that, like every other trainer here, it sees the text with no merge barriers.
+        max_sentence_length=len(text.encode("utf-8")) + 1,
         minloglevel=2,
     )
 

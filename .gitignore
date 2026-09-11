@@ -5,3 +5,5 @@
 /models/
 *.model
 *.vocab
+# bench.py imports train_comparators.py, so Python caches bytecode next to it.
+__pycache__/
