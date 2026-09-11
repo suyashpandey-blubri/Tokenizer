@@ -1988,4 +1988,288 @@ mod tests {
         let e = Tokenizer::load(Path::new("no/such/model.model")).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::NotFound);
     }
+
+    // -- property tests ---------------------------------------------------------------
+    //
+    // Everything above this line is an EXAMPLE test: a hand-picked input paired with a
+    // hand-written expected answer. That only ever checks the inputs someone thought of.
+    //
+    // The tests below state a RULE that has to hold for *every* input, and `proptest`
+    // generates hundreds of inputs trying to break it. When one does break it, proptest
+    // shrinks the failure down to the smallest input that still fails — so the report is
+    // `"a\u{301}"` rather than the 200-character string that happened to contain it.
+    //
+    // A failure also gets written to `proptest-regressions/`, which is committed: a case
+    // found once is replayed on every run from then on.
+    //
+    // These live here rather than in `tests/` because T1 needs the private `normalizer`
+    // field — there is deliberately no public accessor for it — and only a unit test in
+    // this file can see it.
+    mod props {
+        use super::*;
+        use proptest::prelude::*;
+        use std::sync::OnceLock;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // -- generators ---------------------------------------------------------------
+
+        /// The alphabet these properties draw from.
+        ///
+        /// `any::<char>()` and `any::<String>()` are overwhelmingly ASCII. They would run
+        /// every case below without once producing a combining mark or a 4-byte character
+        /// — which are precisely the inputs that can break a *byte*-level tokenizer, since
+        /// a merge is free to join half of a multi-byte character. So the weights are set
+        /// by hand, and every arm is here for a specific reason.
+        fn interesting_char() -> impl Strategy<Value = char> {
+            prop_oneof![
+                // Ordinary text. Whitespace gets its own arm because the split pattern
+                // treats it in three separate branches: `\s*[\r\n]`, `\s+(?!\S)`, `\s+`.
+                10 => prop_oneof![
+                    9 => proptest::char::range(' ', '~'),
+                    1 => prop::sample::select(vec![' ', '\t', '\n', '\r']),
+                ],
+                // 2-byte UTF-8.
+                3 => proptest::char::range('\u{00a1}', '\u{024f}'),
+                // Category M — the class `\p{L}` does *not* cover. This is the subject of
+                // step 15 and the reason a letters-only pattern cuts Indic words apart.
+                3 => proptest::char::range('\u{0300}', '\u{036f}'),
+                // 3-byte, and full of category-M matras and viramas.
+                3 => proptest::char::range('\u{0900}', '\u{097f}'),
+                2 => proptest::char::range('\u{0b80}', '\u{0bff}'),
+                // 3-byte with no word spaces at all.
+                2 => proptest::char::range('\u{4e00}', '\u{4fff}'),
+                // Category Cf: invisible, and `render_token` deliberately does not escape
+                // these — it escapes Cc only.
+                1 => prop::sample::select(vec!['\u{200c}', '\u{200d}']),
+                // 4-byte UTF-8: the longest encoding, so the most ways for a merge to
+                // land halfway through a character.
+                1 => proptest::char::range('\u{1f300}', '\u{1f5ff}'),
+            ]
+        }
+
+        fn interesting_text() -> impl Strategy<Value = String> {
+            prop::collection::vec(interesting_char(), 0..200)
+                .prop_map(|chars| chars.into_iter().collect())
+        }
+
+        /// Token ids for the `decode`-never-panics property. Deliberately *not* only valid
+        /// ids: the point is what happens on the ones a caller should not have sent.
+        fn arbitrary_ids() -> impl Strategy<Value = Vec<u32>> {
+            let id = prop_oneof![
+                // Mostly in range. The shared tokenizer asks for 320 but ends at 288:
+                // `corpus()` is 900 bytes, so `train` runs out of pairs and stops early —
+                // which is why nothing here hard-codes a vocabulary size as a bound.
+                6 => 0u32..288,
+                // Straddles both boundaries that matter: 256, where learned tokens start,
+                // and the end of the vocabulary, wherever training actually stopped.
+                3 => 250u32..400,
+                // The value most likely to index out of bounds.
+                1 => Just(u32::MAX),
+            ];
+            prop::collection::vec(id, 0..64)
+        }
+
+        // -- shared fixtures ----------------------------------------------------------
+        //
+        // Training and regex compilation are the expensive parts, and a property runs its
+        // body hundreds of times. Both are done once and shared.
+
+        fn trained_with(normalizer: Normalizer) -> Tokenizer {
+            let mut tok = Tokenizer::with_config(GPT4_SPLIT_PATTERN, normalizer);
+            tok.train(&corpus(), 320, false);
+            tok
+        }
+
+        fn cached(normalizer: Normalizer) -> &'static Tokenizer {
+            static NONE: OnceLock<Tokenizer> = OnceLock::new();
+            static NFC: OnceLock<Tokenizer> = OnceLock::new();
+            static NFD: OnceLock<Tokenizer> = OnceLock::new();
+            let cell = match normalizer {
+                Normalizer::None => &NONE,
+                Normalizer::Nfc => &NFC,
+                Normalizer::Nfd => &NFD,
+            };
+            cell.get_or_init(|| trained_with(normalizer))
+        }
+
+        /// Untrained: `split` depends only on the pattern, so training would be wasted.
+        fn splitter(pattern: &'static str) -> &'static Tokenizer {
+            static GPT4: OnceLock<Tokenizer> = OnceLock::new();
+            static GPT2: OnceLock<Tokenizer> = OnceLock::new();
+            let cell = if pattern == GPT4_SPLIT_PATTERN { &GPT4 } else { &GPT2 };
+            cell.get_or_init(|| Tokenizer::with_config(pattern, Normalizer::None))
+        }
+
+        // -- T1: round trip -----------------------------------------------------------
+
+        proptest! {
+            /// The core contract, on generated input.
+            ///
+            /// Stated over `normalize(s)` and NOT over `s`, deliberately. `encode_ordinary`
+            /// normalizes internally before splitting, so under NFC the input `"e" + U+0301`
+            /// legitimately comes back as `"é"` — different bytes from what went in.
+            /// Normalization is encode-side only and therefore inherently lossy; there is an
+            /// example test above asserting exactly that. Writing this property over `s`
+            /// would contradict it.
+            #[test]
+            fn t1_decode_of_encode_returns_the_normalized_input(s in interesting_text()) {
+                for normalizer in [Normalizer::None, Normalizer::Nfc, Normalizer::Nfd] {
+                    let tok = cached(normalizer);
+                    let ids = tok.encode_ordinary(&s);
+                    let back = tok.decode(&ids).expect("decoding our own ids cannot fail");
+                    prop_assert_eq!(
+                        back,
+                        normalizer.normalize(&s).into_owned(),
+                        "round trip broke under {:?}",
+                        normalizer
+                    );
+                }
+            }
+        }
+
+        // -- T2: the pre-tokenizer loses nothing ---------------------------------------
+
+        proptest! {
+            /// `split` is `find_iter().map(as_str).collect()` — it keeps the *matches* and
+            /// silently drops anything between them. So a pattern that fails to match some
+            /// character does not error: it deletes it, and the text is gone before BPE
+            /// ever sees it.
+            ///
+            /// Both built-in patterns are total today, which is the only reason this holds.
+            /// Nothing pinned that until now, and `load` will accept an arbitrary pattern
+            /// out of a `.model` file with no totality check at all.
+            #[test]
+            fn t2_concatenating_the_split_pieces_rebuilds_the_input(s in interesting_text()) {
+                for pattern in [GPT4_SPLIT_PATTERN, GPT2_SPLIT_PATTERN] {
+                    let pieces = splitter(pattern).split(&s);
+                    prop_assert_eq!(pieces.concat(), s.clone(), "pattern dropped input");
+                }
+            }
+        }
+
+        // -- T3: ids, determinism, and not panicking -----------------------------------
+
+        proptest! {
+            /// Two rules at once, because they share an encode.
+            ///
+            /// Determinism is not free: `HashMap` iteration order is randomized in Rust, so
+            /// before the `(count, Reverse(pair))` tie-break was introduced the winning pair
+            /// on a tie differed between runs of the same binary.
+            #[test]
+            fn t3_ids_are_in_range_and_encoding_is_deterministic(s in interesting_text()) {
+                let tok = cached(Normalizer::None);
+                let first = tok.encode_ordinary(&s);
+                let second = tok.encode_ordinary(&s);
+                prop_assert_eq!(&first, &second, "encode is not deterministic");
+                for &id in &first {
+                    prop_assert!(
+                        (id as usize) < tok.vocab_size(),
+                        "id {} >= vocab_size {}",
+                        id,
+                        tok.vocab_size()
+                    );
+                }
+            }
+        }
+
+        proptest! {
+            /// `decode` takes ids from anywhere — a file, a network, a model mismatch — so
+            /// an out-of-range id has to be an `Err`, never an index panic. This is the
+            /// exact class of bug fixed in step 8, when special-token ids started living
+            /// above `vocab.len()` and the old bounds check stopped being sufficient.
+            ///
+            /// Either answer is acceptable here. Only a panic is a failure.
+            #[test]
+            fn t3_decode_never_panics_on_arbitrary_ids(ids in arbitrary_ids()) {
+                let _ = cached(Normalizer::None).decode(&ids);
+            }
+        }
+
+        // -- T4: save/load/save is a fixpoint ------------------------------------------
+
+        /// A unique path prefix under the system temp directory, cleaned up on drop.
+        ///
+        /// There is no `tempfile` dev-dependency and this does not add one: the project's
+        /// dependency list is deliberately short, and the whole need here is two file names
+        /// and a guaranteed cleanup. `Drop` runs even when a property fails mid-case, which
+        /// matters when proptest is about to re-run the body dozens of times while shrinking.
+        struct TempPrefix(std::path::PathBuf);
+
+        impl TempPrefix {
+            fn new() -> Self {
+                static COUNTER: AtomicU64 = AtomicU64::new(0);
+                let mut path = std::env::temp_dir();
+                path.push(format!(
+                    "naive_bbpe_prop_{}_{}",
+                    std::process::id(),
+                    COUNTER.fetch_add(1, Ordering::Relaxed)
+                ));
+                TempPrefix(path)
+            }
+
+            /// `save` appends rather than replacing an extension, so the file it writes for
+            /// prefix `p` is literally `p` + `".model"`. Mirror that here.
+            fn with_ext(&self, ext: &str) -> std::path::PathBuf {
+                let mut p = self.0.as_os_str().to_owned();
+                p.push(ext);
+                std::path::PathBuf::from(p)
+            }
+        }
+
+        impl Drop for TempPrefix {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(self.with_ext(".model"));
+                let _ = fs::remove_file(self.with_ext(".vocab"));
+            }
+        }
+
+        proptest! {
+            // Every case trains a tokenizer, which is far more work than the other
+            // properties do, so this one runs fewer cases. Slow tests get skipped, and a
+            // skipped test checks nothing.
+            #![proptest_config(ProptestConfig::with_cases(32))]
+
+            /// Saving a model, loading it back and saving again must produce the same bytes.
+            ///
+            /// This is the property that `.model` not storing the vocabulary depends on:
+            /// `load` rebuilds `vocab` by replaying the merge lines through the same
+            /// concatenation loop `train` runs. If replay disagreed with training in any
+            /// way, the second `.vocab` would differ from the first.
+            ///
+            /// A special token is registered so the `num_special` header and its lines are
+            /// covered too, not just the merge lines.
+            #[test]
+            fn t4_save_load_save_is_byte_identical(s in interesting_text()) {
+                // Generated text alone can be empty or have no repeats, which would learn
+                // no merges and make the property vacuous. Prepending the fixed corpus
+                // guarantees there is always something to learn while still varying with `s`.
+                let mut tok = Tokenizer::new();
+                tok.train(&format!("{}{}", corpus(), s), 300, false);
+                let special_id = tok.vocab_size() as u32;
+                tok.register_special_tokens(&[("<|endoftext|>".to_string(), special_id)])
+                    .expect("id is exactly vocab_size, which is the lowest legal one");
+
+                let first = TempPrefix::new();
+                let second = TempPrefix::new();
+                tok.save(&first.0).expect("writing to the temp dir");
+                let reloaded =
+                    Tokenizer::load(&first.with_ext(".model")).expect("reading back our own file");
+                reloaded.save(&second.0).expect("writing to the temp dir");
+
+                // Compared as bytes, and reported as a length rather than a diff: printing
+                // two 14 KB files on failure would bury the shrunk input that explains it.
+                let (a, b) = (
+                    fs::read(first.with_ext(".model")).unwrap(),
+                    fs::read(second.with_ext(".model")).unwrap(),
+                );
+                prop_assert!(a == b, ".model differs after reload ({} vs {} bytes)", a.len(), b.len());
+
+                let (a, b) = (
+                    fs::read(first.with_ext(".vocab")).unwrap(),
+                    fs::read(second.with_ext(".vocab")).unwrap(),
+                );
+                prop_assert!(a == b, ".vocab differs after reload ({} vs {} bytes)", a.len(), b.len());
+            }
+        }
+    }
 }
