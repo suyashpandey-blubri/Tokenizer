@@ -7,3 +7,6 @@
 *.vocab
 # bench.py imports train_comparators.py, so Python caches bytecode next to it.
 __pycache__/
+# Step reports are analysis of the tokenizer, not part of how it works. Kept in the
+# working tree, deliberately never pushed.
+*_REPORT.md
