@@ -37,6 +37,26 @@ use unicode_normalization::UnicodeNormalization;
 // Pure helpers — no tokenizer state, so they stay free functions
 // ---------------------------------------------------------------------------
 
+/// The byte alphabet: one token per possible byte value, minted before training starts.
+/// This is *the* reason byte-level BPE has no out-of-vocabulary case — every input byte
+/// already has an id, so there is nothing to fall back to.
+///
+/// It is a named constant because the number is load-bearing in four places across two
+/// functions written independently of each other: `with_config` and `load` both build the
+/// initial table, and `train` and `load` both mint ids as `BYTE_ALPHABET + i`. `load`
+/// carries its own copy of arithmetic `train` also performs — the two must agree forever,
+/// and until now nothing in the code said so.
+const BYTE_ALPHABET: u32 = 256;
+
+/// The untrained vocabulary: `vocab[i] == [i]` for every byte value.
+///
+/// Extracted because `with_config` and `load` held two verbatim copies of it. `load` is the
+/// one that matters: it must reconstruct *exactly* the state `train` started from, or
+/// replaying the merge list rebuilds a different table than the one that was saved.
+fn initial_vocab() -> Vec<Vec<u8>> {
+    (0..BYTE_ALPHABET).map(|i| vec![i as u8]).collect()
+}
+
 /// Counting all number of occurring pairs, accumulating into a caller-supplied map.
 /// Python: `for pair in zip(ids, ids[1:]): counts[pair] = counts.get(pair, 0) + 1`
 /// Takes `&mut` rather than returning a fresh map because with a pre-tokenizer the counts
@@ -429,7 +449,7 @@ impl Tokenizer {
     pub fn with_config(pattern: &str, normalizer: Normalizer) -> Self {
         Tokenizer {
             merges: HashMap::new(),
-            vocab: (0..256u32).map(|i| vec![i as u8]).collect(),
+            vocab: initial_vocab(),
             normalizer,
             pattern: Regex::new(pattern).expect("split pattern failed to compile"),
             special_tokens: HashMap::new(),
@@ -527,8 +547,11 @@ impl Tokenizer {
 
     /// All of training, in one place: text in, both tables filled.
     pub fn train(&mut self, text: &str, vocab_size: u32, verbose: bool) {
-        assert!(vocab_size >= 256, "vocab_size must leave room for the 256 byte tokens");
-        let new_tokens = vocab_size - 256;
+        assert!(
+            vocab_size >= BYTE_ALPHABET,
+            "vocab_size must leave room for the 256 byte tokens"
+        );
+        let new_tokens = vocab_size - BYTE_ALPHABET;
 
         // `verbose` used to print one line per merge. That was fine for 20 merges and is
         // useless for 49744 — so it now reports roughly 20 times over the whole run,
@@ -592,12 +615,15 @@ impl Tokenizer {
             let Some((p0, p1)) = index.pop_best() else {
                 // Reachable because chunks are short: they can all shrink to length 1.
                 if verbose {
-                    println!("no pairs left; stopping early at vocab size {}", 256 + i);
+                    println!(
+                        "no pairs left; stopping early at vocab size {}",
+                        BYTE_ALPHABET + i
+                    );
                 }
                 break;
             };
 
-            let idx = 256 + i; // this is our new token
+            let idx = BYTE_ALPHABET + i; // this is our new token
 
             // Only the chunks that actually contain this pair are touched. Everything else
             // is untouched and its contribution to `stats` stays correct — which is the
@@ -886,7 +912,7 @@ impl Tokenizer {
 
         let mut tok = Tokenizer {
             merges: HashMap::new(),
-            vocab: (0..256u32).map(|i| vec![i as u8]).collect(),
+            vocab: initial_vocab(),
             normalizer,
             pattern: compiled,
             // Registered further down, once the merges have been replayed:
@@ -921,7 +947,7 @@ impl Tokenizer {
                 )));
             }
 
-            let idx = 256 + i as u32;
+            let idx = BYTE_ALPHABET + i as u32;
             tok.merges.insert((p0, p1), idx);
             let mut bytes = tok.vocab[p0 as usize].clone();
             bytes.extend_from_slice(&tok.vocab[p1 as usize]);
