@@ -8,4 +8,12 @@ fancy-regex = "0.19.0"
 unicode-normalization = "0.1.25"
 
 [dev-dependencies]
+criterion = "0.8.2"
 proptest = "1.11.0"
+
+# `harness = false` hands the whole binary to criterion. Without it Cargo links the
+# built-in `libtest` harness, which only understands `#[bench]` and would ignore
+# criterion's `main` entirely.
+[[bench]]
+name = "tokenizer"
+harness = false
