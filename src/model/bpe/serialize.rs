@@ -297,7 +297,10 @@ impl Tokenizer {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Named rather than `use super::*`: this module holds exactly one test of exactly one
+    // function, so a glob would pull in `fs`, `io`, `Path`, `HashMap`, `Normalizer`,
+    // `Tokenizer` and the rest for nothing.
+    use super::render_token;
 
     // The ONE serialization test that is a unit test of a free function. The other 13
     // persistence and malformed-model tests stay in `lib.rs`: they drive `tok.save()` and
