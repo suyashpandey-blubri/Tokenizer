@@ -141,9 +141,10 @@ impl PairIndex {
     }
 
     /// Record that chunk `index` changed from `old` to `new`.
-    /// `old_bounds` and `new_bounds` are the gap masks before and after the merge. They
-    /// differ once 12.4b makes `merge` shrink the mask alongside the chunk; until then the
-    /// caller passes the same `Unrestricted` for both.
+    /// `old_bounds` and `new_bounds` are the gap masks before and after the merge, and they
+    /// are genuinely different objects: a merge consumes one gap and renumbers every gap to
+    /// its right, so `before` must be counted under the old mask and `after` under the new.
+    /// Using one for both would miscount the delta the moment boundaries stop being uniform.
     pub(crate) fn apply_chunk_change(
         &mut self,
         index: usize,
@@ -341,7 +342,7 @@ mod tests {
         let counts = vec![1];
         let mut index = PairIndex::build(&chunks, &counts, &CorpusBoundaries::AllUnrestricted);
 
-        let merged = merge(&chunks[0], (1, 1), 256);
+        let merged = merge(&chunks[0], (1, 1), 256, &Boundaries::Unrestricted).0;
         assert_eq!(merged, vec![7, 256, 8]);
         index.apply_chunk_change(
             0,
@@ -375,7 +376,7 @@ mod tests {
         let mut index = PairIndex::build(&chunks, &counts, &CorpusBoundaries::AllUnrestricted);
         assert_eq!(index.stats.get(&(1, 1)), Some(&12)); // 3 occurrences x weight 4
 
-        let merged = merge(&chunks[0], (1, 1), 256);
+        let merged = merge(&chunks[0], (1, 1), 256, &Boundaries::Unrestricted).0;
         assert_eq!(merged, vec![256, 256]);
         index.apply_chunk_change(
             0,

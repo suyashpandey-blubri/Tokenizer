@@ -83,7 +83,7 @@ impl BpeTrainer {
     pub(crate) fn train(
         &self,
         mut chunks: Vec<Vec<u32>>,
-        bounds: CorpusBoundaries,
+        mut bounds: CorpusBoundaries,
         counts: Vec<u64>,
     ) -> BpeModel {
         let mut model = BpeModel::untrained();
@@ -138,12 +138,21 @@ impl BpeTrainer {
             // many times it occurs, so the two vectors stay aligned by construction.
             for ci in index.chunks_containing((p0, p1)) {
                 let old = std::mem::take(&mut chunks[ci]);
-                let new = merge(&old, (p0, p1), idx);
-                // Same `bounds[ci]` twice until 12.4b teaches `merge` to shrink the mask
-                // alongside the chunk. Correct for `Unrestricted`, which has no length.
-                let b = bounds.for_chunk(ci);
-                index.apply_chunk_change(ci, &old, b, &new, b, counts[ci]);
+                let old_bounds = bounds.for_chunk(ci).clone();
+                // `merge` returns the rewritten chunk AND its gap mask, because a merge
+                // consumes a gap and renumbers the ones to its right. The index has to see
+                // both masks: `before` is counted under the old one, `after` under the new.
+                let (new, new_bounds) = merge(&old, (p0, p1), idx, &old_bounds);
+                index.apply_chunk_change(
+                    ci,
+                    &old,
+                    &old_bounds,
+                    &new,
+                    &new_bounds,
+                    counts[ci],
+                );
                 chunks[ci] = new;
+                bounds.set_chunk(ci, new_bounds);
             }
             #[cfg(test)]
             index.assert_consistent(&chunks, &counts, &bounds, &format!("merging {:?}", (p0, p1)));

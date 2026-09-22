@@ -109,6 +109,24 @@ impl CorpusBoundaries {
             CorpusBoundaries::PerChunk(per) => &per[i],
         }
     }
+
+    /// Replace chunk `i`'s mask after a merge rewrote it.
+    ///
+    /// A no-op for `AllUnrestricted`, and correctly so: merging cannot make an unrestricted
+    /// chunk restricted, so there is nothing to record. That is also why the B0 path still
+    /// allocates nothing per chunk even though the trainer now writes back on every merge.
+    pub(crate) fn set_chunk(&mut self, i: usize, bounds: Boundaries) {
+        match self {
+            CorpusBoundaries::AllUnrestricted => {
+                debug_assert_eq!(
+                    bounds,
+                    Boundaries::Unrestricted,
+                    "an unrestricted chunk cannot become restricted by merging"
+                );
+            }
+            CorpusBoundaries::PerChunk(per) => per[i] = bounds,
+        }
+    }
 }
 
 #[cfg(test)]

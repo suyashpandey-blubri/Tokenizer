@@ -18,6 +18,8 @@
 
 use std::collections::HashMap;
 
+use crate::text::boundary::Boundaries;
+
 /// The byte alphabet: one token per possible byte value, minted before training starts.
 /// This is *the* reason byte-level BPE has no out-of-vocabulary case — every input byte
 /// already has an id, so there is nothing to fall back to.
@@ -181,10 +183,38 @@ impl BpeModel {
 ///
 /// The counter is `u64` because a weighted total can exceed `u32`: 1 GB of English holds
 /// on the order of 10^9 pairs, and one common pair can account for a large share of them.
-pub(crate) fn get_stats_into(counts: &mut HashMap<(u32, u32), u64>, ids: &[u32], weight: u64) {
-    for window in ids.windows(2) {
-        let pair = (window[0], window[1]);
-        *counts.entry(pair).or_insert(0) += weight;
+/// `bounds` matters here for the same reason it matters in `pairs_of`: this is how
+/// `encode_chunk` DISCOVERS candidate pairs, so a pair that only occurs at forbidden gaps
+/// must never become a candidate. Missing it would let encode apply a merge that training
+/// could not have learned at that position.
+pub(crate) fn get_stats_into(
+    counts: &mut HashMap<(u32, u32), u64>,
+    ids: &[u32],
+    weight: u64,
+    bounds: &Boundaries,
+) {
+    // The match is hoisted OUT of the loop on purpose. Asking `bounds.permits(gap)` per gap
+    // cost a measured +6.6% on `encode/article` at 12.4b, because `encode_chunk` rebuilds
+    // these stats on every merge iteration — so the check landed in an O(len^2) inner loop.
+    // Specialising the two cases costs one duplicated three-line body and gives B0 a loop
+    // with no boundary work in it at all.
+    match bounds {
+        Boundaries::Unrestricted => {
+            for window in ids.windows(2) {
+                let pair = (window[0], window[1]);
+                *counts.entry(pair).or_insert(0) += weight;
+            }
+        }
+        // Window index == gap index; see `merge`.
+        Boundaries::Mask(mask) => {
+            for (gap, window) in ids.windows(2).enumerate() {
+                if !mask.get(gap).copied().unwrap_or(false) {
+                    continue;
+                }
+                let pair = (window[0], window[1]);
+                *counts.entry(pair).or_insert(0) += weight;
+            }
+        }
     }
 }
 
@@ -194,19 +224,63 @@ pub(crate) fn get_stats_into(counts: &mut HashMap<(u32, u32), u64>, ids: &[u32],
 /// pair. It's written as an addition because `len()` is unsigned, so `len() - 1` would
 /// underflow on an empty input. The outer loop still runs to the final index, because
 /// that last element still has to be copied to the output.
-pub(crate) fn merge(ids: &[u32], pair: (u32, u32), idx: u32) -> Vec<u32> {
+/// `bounds` gates each occurrence: an occurrence starting at `i` crosses gap `i`, so it is
+/// only replaced if that gap is permitted. Returns the rewritten ids **and the gap mask that
+/// belongs to them** — merging consumes a gap and renumbers every gap to its right, so the
+/// two have to be produced together or they fall out of step immediately.
+///
+/// The mask arithmetic is one expression in both branches. After a step, `i` has already
+/// advanced past whatever was emitted, so the gap that follows the emitted element in the
+/// *output* is input gap `i - 1`:
+///
+/// ```text
+///   copy  ids[i]            i += 1   ->  following gap is input gap i-1  (== old i)
+///   merge ids[i], ids[i+1]  i += 2   ->  following gap is input gap i-1  (== old i+1)
+/// ```
+///
+/// and the final element has no gap after it, which `i < ids.len()` takes care of.
+pub(crate) fn merge(
+    ids: &[u32],
+    pair: (u32, u32),
+    idx: u32,
+    bounds: &Boundaries,
+) -> (Vec<u32>, Boundaries) {
     let mut newids = Vec::with_capacity(ids.len());
+
+    // Two loops rather than one with a check inside it, for the reason spelled out on
+    // `get_stats_into`: this is called once per merge iteration inside `encode_chunk`, so a
+    // per-position enum match is in the hottest path the crate has. The B0 arm below is
+    // byte-for-byte the pre-12.4 loop.
+    let Boundaries::Mask(mask) = bounds else {
+        let mut i = 0;
+        while i < ids.len() {
+            if i + 1 < ids.len() && ids[i] == pair.0 && ids[i + 1] == pair.1 {
+                newids.push(idx);
+                i += 2;
+            } else {
+                newids.push(ids[i]);
+                i += 1;
+            }
+        }
+        return (newids, Boundaries::Unrestricted);
+    };
+
+    let permits = |gap: usize| mask.get(gap).copied().unwrap_or(false);
+    let mut newmask = Vec::with_capacity(ids.len());
     let mut i = 0;
     while i < ids.len() {
-        if i + 1 < ids.len() && ids[i] == pair.0 && ids[i + 1] == pair.1 {
+        if i + 1 < ids.len() && ids[i] == pair.0 && ids[i + 1] == pair.1 && permits(i) {
             newids.push(idx);
             i += 2;
         } else {
             newids.push(ids[i]);
             i += 1;
         }
+        if i < ids.len() {
+            newmask.push(permits(i - 1));
+        }
     }
-    newids
+    (newids, Boundaries::Mask(newmask))
 }
 
 #[cfg(test)]
@@ -219,7 +293,7 @@ mod tests {
     #[test]
     fn merge_replaces_non_overlapping_pairs() {
         // The case traced by hand in a scratch program and then thrown away.
-        assert_eq!(merge(&[97, 97, 97, 98], (97, 97), 256), vec![256, 97, 98]);
+        assert_eq!(merge(&[97, 97, 97, 98], (97, 97), 256, &Boundaries::Unrestricted).0, vec![256, 97, 98]);
     }
 
     #[test]
@@ -227,38 +301,126 @@ mod tests {
         // The `i + 1` question: does the guard make the scan start at index 1? No —
         // `i` starts at 0 and `ids[i]` is always examined. If it did skip, this would
         // come back as [120, 121, 5, 5].
-        assert_eq!(merge(&[120, 121, 5, 5], (120, 121), 300), vec![300, 5, 5]);
+        assert_eq!(merge(&[120, 121, 5, 5], (120, 121), 300, &Boundaries::Unrestricted).0, vec![300, 5, 5]);
     }
 
     #[test]
     fn merge_copies_the_last_element() {
         // The last element can't start a pair, but it still has to reach the output.
-        assert_eq!(merge(&[1, 2, 3], (1, 2), 256), vec![256, 3]);
+        assert_eq!(merge(&[1, 2, 3], (1, 2), 256, &Boundaries::Unrestricted).0, vec![256, 3]);
     }
 
     #[test]
     fn merge_on_empty_input_does_not_underflow() {
         // This is why the guard is written `i + 1 < ids.len()` and not `i < ids.len() - 1`:
         // `len()` is unsigned, so `0 - 1` would panic in debug and wrap in release.
-        assert_eq!(merge(&[], (1, 2), 256), Vec::<u32>::new());
+        assert_eq!(merge(&[], (1, 2), 256, &Boundaries::Unrestricted).0, Vec::<u32>::new());
     }
 
     #[test]
     fn merge_on_single_element_is_identity() {
-        assert_eq!(merge(&[42], (42, 42), 256), vec![42]);
+        assert_eq!(merge(&[42], (42, 42), 256, &Boundaries::Unrestricted).0, vec![42]);
     }
 
     #[test]
     fn merge_with_no_match_is_identity() {
-        assert_eq!(merge(&[1, 2, 3], (9, 9), 256), vec![1, 2, 3]);
+        assert_eq!(merge(&[1, 2, 3], (9, 9), 256, &Boundaries::Unrestricted).0, vec![1, 2, 3]);
     }
 
     #[test]
     fn merge_of_an_overlapping_run_takes_pairs_left_to_right() {
         // [97,97,97] contains (97,97) at index 0 AND index 1, but they overlap. Scanning
         // left to right takes the first and leaves the leftover 97 alone.
-        assert_eq!(merge(&[97, 97, 97], (97, 97), 256), vec![256, 97]);
-        assert_eq!(merge(&[97, 97, 97, 97], (97, 97), 256), vec![256, 256]);
+        assert_eq!(merge(&[97, 97, 97], (97, 97), 256, &Boundaries::Unrestricted).0, vec![256, 97]);
+        assert_eq!(merge(&[97, 97, 97, 97], (97, 97), 256, &Boundaries::Unrestricted).0, vec![256, 256]);
+    }
+
+    /// LIVE-SEAM TEST, applying side: a forbidden gap must block the merge.
+    ///
+    /// Everything production does passes `Unrestricted`, so without this the boundary
+    /// argument to `merge` would compile and be entirely decorative.
+    #[test]
+    fn merge_refuses_a_forbidden_gap() {
+        //   ids:   [97][97][97][97]      merging (97,97)
+        //   gaps:     0   1   2
+        let ids = [97, 97, 97, 97];
+
+        // Unrestricted: left-to-right, non-overlapping, so gaps 0 and 2 are taken.
+        assert_eq!(
+            merge(&ids, (97, 97), 256, &Boundaries::Unrestricted).0,
+            vec![256, 256]
+        );
+
+        // Forbid gap 0. The scan then finds the occurrence at gap 1 instead — which is a
+        // DIFFERENT merge, not merely a missing one, and is exactly why the trainer must
+        // not count occurrences it cannot apply.
+        assert_eq!(
+            merge(&ids, (97, 97), 256, &Boundaries::Mask(vec![false, true, true])).0,
+            vec![97, 256, 97]
+        );
+
+        // Forbid everything: the chunk comes back untouched.
+        assert_eq!(
+            merge(&ids, (97, 97), 256, &Boundaries::Mask(vec![false; 3])).0,
+            ids.to_vec()
+        );
+    }
+
+    /// LIVE-SEAM TEST, and the subtlest claim in 12.4b: **a merge renumbers the gaps to its
+    /// right**, so the mask that comes back must be shifted, not merely shortened.
+    ///
+    /// If this were wrong the failure would be quiet and cumulative — every subsequent merge
+    /// in the same chunk would consult the wrong gap, so boundaries would drift further out
+    /// of alignment the longer training ran.
+    #[test]
+    fn merge_shifts_the_mask_left_of_what_it_consumed() {
+        //   ids:   [ a ][ b ][ c ][ d ]        merging (b, c) consumes gap 1
+        //   gaps:     0    1    2
+        //   out:   [ a ][ bc ][ d ]
+        //   gaps:     0'    1'                 0' == old 0,  1' == old 2
+        let ids = [1, 2, 3, 4];
+
+        // Distinguishable values, so a shift is visible and a truncation is not enough:
+        // old gap 2 is `false`, and it must land at new gap 1.
+        let (out, mask) = merge(
+            &ids,
+            (2, 3),
+            256,
+            &Boundaries::Mask(vec![true, true, false]),
+        );
+        assert_eq!(out, vec![1, 256, 4]);
+        assert_eq!(
+            mask,
+            Boundaries::Mask(vec![true, false]),
+            "new gap 1 must carry OLD gap 2's flag, not old gap 1's"
+        );
+
+        // A chunk that merges down to one token has no gaps left.
+        let (out, mask) = merge(&[1, 2], (1, 2), 256, &Boundaries::Mask(vec![true]));
+        assert_eq!(out, vec![256]);
+        assert_eq!(mask, Boundaries::Mask(vec![]));
+
+        // Unrestricted in, unrestricted out — and no allocation on the way through.
+        let (_, mask) = merge(&ids, (2, 3), 256, &Boundaries::Unrestricted);
+        assert_eq!(mask, Boundaries::Unrestricted);
+    }
+
+    /// The encode-side counterpart of `a_forbidden_gap_is_not_counted`: `get_stats_into` is
+    /// how `encode_chunk` DISCOVERS candidates, so a forbidden gap must not produce one.
+    #[test]
+    fn get_stats_skips_forbidden_gaps() {
+        let mut counts = HashMap::new();
+        get_stats_into(&mut counts, &[97, 97, 97, 97], 1, &Boundaries::Unrestricted);
+        assert_eq!(counts.get(&(97, 97)), Some(&3));
+
+        let mut counts = HashMap::new();
+        get_stats_into(
+            &mut counts,
+            &[97, 97, 97, 97],
+            1,
+            &Boundaries::Mask(vec![true, false, true]),
+        );
+        assert_eq!(counts.get(&(97, 97)), Some(&2));
     }
 
     // -- get_stats_into ---------------------------------------------------------
@@ -266,7 +428,7 @@ mod tests {
     #[test]
     fn get_stats_counts_adjacent_pairs() {
         let mut counts = HashMap::new();
-        get_stats_into(&mut counts, &[1, 2, 3], 1);
+        get_stats_into(&mut counts, &[1, 2, 3], 1, &Boundaries::Unrestricted);
         assert_eq!(counts.get(&(1, 2)), Some(&1));
         assert_eq!(counts.get(&(2, 3)), Some(&1));
         assert_eq!(counts.len(), 2);
@@ -275,7 +437,7 @@ mod tests {
     #[test]
     fn get_stats_counts_repeats() {
         let mut counts = HashMap::new();
-        get_stats_into(&mut counts, &[1, 1, 1], 1);
+        get_stats_into(&mut counts, &[1, 1, 1], 1, &Boundaries::Unrestricted);
         // Unlike `merge`, counting does NOT skip overlaps: (1,1) occurs at index 0 and 1.
         assert_eq!(counts.get(&(1, 1)), Some(&2));
     }
@@ -285,9 +447,9 @@ mod tests {
         // The whole reason this takes `&mut` instead of returning a fresh map: with a
         // pre-tokenizer, counts must be tallied across every chunk before picking a winner.
         let mut counts = HashMap::new();
-        get_stats_into(&mut counts, &[1, 2], 1);
-        get_stats_into(&mut counts, &[1, 2], 1);
-        get_stats_into(&mut counts, &[2, 3], 1);
+        get_stats_into(&mut counts, &[1, 2], 1, &Boundaries::Unrestricted);
+        get_stats_into(&mut counts, &[1, 2], 1, &Boundaries::Unrestricted);
+        get_stats_into(&mut counts, &[2, 3], 1, &Boundaries::Unrestricted);
         assert_eq!(counts.get(&(1, 2)), Some(&2));
         assert_eq!(counts.get(&(2, 3)), Some(&1));
     }
@@ -296,11 +458,11 @@ mod tests {
     fn get_stats_weights_each_chunk_by_its_occurrence_count() {
         // The heart of step 9: one weighted addition must equal N unweighted ones.
         let mut weighted = HashMap::new();
-        get_stats_into(&mut weighted, &[1, 2, 3], 30_000_000);
+        get_stats_into(&mut weighted, &[1, 2, 3], 30_000_000, &Boundaries::Unrestricted);
 
         let mut repeated = HashMap::new();
         for _ in 0..1000 {
-            get_stats_into(&mut repeated, &[1, 2, 3], 30_000);
+            get_stats_into(&mut repeated, &[1, 2, 3], 30_000, &Boundaries::Unrestricted);
         }
         assert_eq!(weighted, repeated);
         assert_eq!(weighted.get(&(1, 2)), Some(&30_000_000));
@@ -312,15 +474,15 @@ mod tests {
         // common pair in a large corpus can pass that, and wrapping would silently pick the
         // wrong merge.
         let mut counts = HashMap::new();
-        get_stats_into(&mut counts, &[1, 2], u32::MAX as u64 + 1000);
+        get_stats_into(&mut counts, &[1, 2], u32::MAX as u64 + 1000, &Boundaries::Unrestricted);
         assert_eq!(counts.get(&(1, 2)), Some(&(u32::MAX as u64 + 1000)));
     }
 
     #[test]
     fn get_stats_on_too_short_input_yields_nothing() {
         let mut counts = HashMap::new();
-        get_stats_into(&mut counts, &[], 1);
-        get_stats_into(&mut counts, &[7], 1);
+        get_stats_into(&mut counts, &[], 1, &Boundaries::Unrestricted);
+        get_stats_into(&mut counts, &[7], 1, &Boundaries::Unrestricted);
         assert!(counts.is_empty(), "a slice shorter than 2 has no pairs");
     }
 

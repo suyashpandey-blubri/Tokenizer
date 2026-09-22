@@ -38,6 +38,7 @@ mod text;
 // declared here, and `model/bpe/` is a descendant. What is left in this file after that is
 // the type itself, the encode path, and special tokens.
 use model::bpe::model::{BpeModel, get_stats_into, merge};
+use text::boundary::Boundaries;
 
 // `pub use` is a `use` plus "and let callers outside the crate see it too". These three
 // are the items `main.rs` and `tests/api.rs` import by name, so re-exporting them here is
@@ -301,13 +302,19 @@ impl Tokenizer {
     /// BPE over a single pre-tokenized chunk. This is the whole of the old `encode`.
     fn encode_chunk(&self, text: &str) -> Vec<u32> {
         let mut tokens: Vec<u32> = text.bytes().map(|b| b as u32).collect();
+        // The encode-side twin of the line in `Tokenizer::train`: this is where text
+        // becomes ids, so it is the only place a mask for this chunk can be derived.
+        // BOTH sides must agree — boundaries are positional, so if training respects a
+        // boundary and encoding does not, encoding emits tokens training could never have
+        // learned at that position. B0 forbids nothing; 15.4 replaces this line too.
+        let mut bounds = Boundaries::Unrestricted;
 
         // Running this loop till merging is possible.
         while tokens.len() >= 2 {
             // Weight 1: encoding looks at one piece of text, so there is nothing to
             // deduplicate and the counts are only used as a set of "which pairs exist".
             let mut stats: HashMap<(u32, u32), u64> = HashMap::new();
-            get_stats_into(&mut stats, &tokens, 1);
+            get_stats_into(&mut stats, &tokens, 1, &bounds);
 
             // Python: `min(stats, key=lambda p: merges.get(p, float('inf')))`, then
             // `if pair not in merges: break`. Here we filter to the pairs that are in
@@ -319,7 +326,11 @@ impl Tokenizer {
                 .min();
 
             match best {
-                Some((idx, pair)) => tokens = merge(&tokens, pair, idx),
+                Some((idx, pair)) => {
+                    let (t, b) = merge(&tokens, pair, idx, &bounds);
+                    tokens = t;
+                    bounds = b;
+                }
                 None => break, // we have come to a point where no more merges can be made
             }
         }
