@@ -42,7 +42,7 @@ use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
-use crate::model::bpe::model::{BYTE_ALPHABET, initial_vocab};
+use crate::model::bpe::model::BpeModel;
 use crate::text::pretokenizer::PreTokenizer;
 use crate::{Normalizer, Tokenizer};
 
@@ -144,7 +144,7 @@ impl Tokenizer {
             writeln!(out, "{token} {id}")?;
         }
 
-        for (_, (p0, p1)) in self.merges_in_learned_order() {
+        for (_, (p0, p1)) in self.model.merges_in_learned_order() {
             writeln!(out, "{p0} {p1}")?;
         }
         Ok(())
@@ -160,15 +160,15 @@ impl Tokenizer {
         writeln!(
             out,
             "# {} entries: 256 byte tokens + {} learned",
-            self.vocab.len(),
-            self.merges.len()
+            self.model.vocab_size(),
+            self.model.merge_count()
         )?;
 
         // id -> the pair it was built from, for the learned half.
         let parents: HashMap<u32, (u32, u32)> =
-            self.merges.iter().map(|(&pair, &idx)| (idx, pair)).collect();
+            self.model.merges_in_learned_order().into_iter().collect();
 
-        for (idx, bytes) in self.vocab.iter().enumerate() {
+        for (idx, bytes) in self.model.tokens().enumerate() {
             let rendered = render_token(bytes);
             match parents.get(&(idx as u32)) {
                 // A learned token: show what it was built from, so the file reads as a
@@ -176,23 +176,14 @@ impl Tokenizer {
                 Some(&(p0, p1)) => writeln!(
                     out,
                     "{idx}\t[{rendered}]\t= [{}] + [{}]",
-                    render_token(&self.vocab[p0 as usize]),
-                    render_token(&self.vocab[p1 as usize]),
+                    render_token(self.model.token(p0).expect("a merge's parent exists")),
+                    render_token(self.model.token(p1).expect("a merge's parent exists")),
                 )?,
                 // One of the 256 byte tokens.
                 None => writeln!(out, "{idx}\t[{rendered}]")?,
             }
         }
         Ok(())
-    }
-
-    /// `merges` is a HashMap and has no order of its own. Sorting by the minted id
-    /// recovers the order training created them in.
-    fn merges_in_learned_order(&self) -> Vec<(u32, (u32, u32))> {
-        let mut by_id: Vec<(u32, (u32, u32))> =
-            self.merges.iter().map(|(&pair, &idx)| (idx, pair)).collect();
-        by_id.sort_unstable();
-        by_id
     }
 
     /// Read a `<prefix>.model` written by [`save`](Tokenizer::save).
@@ -242,8 +233,7 @@ impl Tokenizer {
             .map_err(|e| invalid(format!("split pattern does not compile: {e}")))?;
 
         let mut tok = Tokenizer {
-            merges: HashMap::new(),
-            vocab: initial_vocab(),
+            model: BpeModel::untrained(),
             normalizer,
             pattern: compiled,
             // Registered further down, once the merges have been replayed:
@@ -270,7 +260,7 @@ impl Tokenizer {
 
             // A merge can only refer to tokens that already exist. Without this check a
             // corrupt file would index out of bounds and panic.
-            let known = tok.vocab.len() as u32;
+            let known = tok.model.vocab_size() as u32;
             if p0 >= known || p1 >= known {
                 return Err(invalid(format!(
                     "line {line_no}: merge ({p0}, {p1}) refers to a token that does not exist yet \
@@ -278,11 +268,7 @@ impl Tokenizer {
                 )));
             }
 
-            let idx = BYTE_ALPHABET + i as u32;
-            tok.merges.insert((p0, p1), idx);
-            let mut bytes = tok.vocab[p0 as usize].clone();
-            bytes.extend_from_slice(&tok.vocab[p1 as usize]);
-            tok.vocab.push(bytes);
+            tok.model.push_merge((p0, p1));
         }
 
         // Now that vocab is complete, the "id must not shadow a learned token" check is

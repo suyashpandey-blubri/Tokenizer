@@ -112,7 +112,15 @@ impl Tokenizer {
                 break;
             };
 
-            let idx = BYTE_ALPHABET + i; // this is our new token
+            // Mint the new token. One call rather than five lines, and it derives the id
+            // itself — before 12.3a this was five lines here and five more in `load`, each
+            // computing the id its own way (loop counter here, line index there).
+            //
+            // It has to happen BEFORE the chunks are rewritten, because `merge` needs the
+            // id to substitute in. It used to sit after, which was possible only because
+            // `idx` was computed separately from the table it belonged to. Nothing between
+            // here and the loop reads the model, so the observable order is unchanged.
+            let idx = self.model.push_merge((p0, p1));
 
             // Only the chunks that actually contain this pair are touched. Everything else
             // is untouched and its contribution to `stats` stays correct — which is the
@@ -129,15 +137,6 @@ impl Tokenizer {
             #[cfg(test)]
             index.assert_consistent(&chunks, &counts, &format!("merging {:?}", (p0, p1)));
 
-            self.merges.insert((p0, p1), idx);
-
-            // Build this token's byte string immediately, while we still have the pair
-            // in hand. Because we append as we mint, ids stay dense and in order by
-            // construction — no separate vocab-building pass, and nothing to sort.
-            let mut bytes = self.vocab[p0 as usize].clone();
-            bytes.extend_from_slice(&self.vocab[p1 as usize]);
-            self.vocab.push(bytes);
-
             if verbose && (i == 0 || i + 1 == new_tokens || (i + 1) % report_every == 0) {
                 println!(
                     "  merge {:>6}/{}  {:>5} + {:<5} -> {:<5} {:>12}  [{:.1}s]",
@@ -146,7 +145,10 @@ impl Tokenizer {
                     p0,
                     p1,
                     idx,
-                    format!("{:?}", render_token(&self.vocab[idx as usize])),
+                    format!(
+                        "{:?}",
+                        render_token(self.model.token(idx).expect("just pushed"))
+                    ),
                     started.elapsed().as_secs_f64(),
                 );
             }

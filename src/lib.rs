@@ -37,7 +37,7 @@ mod text;
 // with NO visibility change at all: they are `impl Tokenizer` blocks, the fields are
 // declared here, and `model/bpe/` is a descendant. What is left in this file after that is
 // the type itself, the encode path, and special tokens.
-use model::bpe::model::{get_stats_into, initial_vocab, merge};
+use model::bpe::model::{BpeModel, get_stats_into, merge};
 
 // `pub use` is a `use` plus "and let callers outside the crate see it too". These three
 // are the items `main.rs` and `tests/api.rs` import by name, so re-exporting them here is
@@ -59,12 +59,10 @@ use text::pretokenizer::PreTokenizer;
 /// The two tables BPE is made of. `train` writes both; `encode` reads `merges` and
 /// `decode` reads `vocab`. Bundling them is the only reason this type exists.
 pub struct Tokenizer {
-    /// (left_id, right_id) -> new_id. New ids are handed out 256, 257, ... in merge
-    /// order, so the id doubles as the merge rank — no separate ranks table needed.
-    merges: HashMap<(u32, u32), u32>,
-    /// vocab[id] = the byte string that id expands to. `Vec<u8>` is Python's `bytes`.
-    /// Ids are dense 0..vocab_size, so a Vec indexed by id beats a HashMap.
-    vocab: Vec<Vec<u8>>,
+    /// What training produced: the merge list and the table derived from it. One field
+    /// rather than two since 12.3a, because the two were never independent — see
+    /// [`BpeModel`](crate::model::bpe::model::BpeModel).
+    model: BpeModel,
     /// Applied to the text before encoding. Defaults to `None`, matching GPT-4.
     normalizer: Normalizer,
     /// The pre-tokenizer, compiled once at construction rather than per call.
@@ -107,8 +105,8 @@ pub enum AllowedSpecial {
 impl fmt::Debug for Tokenizer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Tokenizer")
-            .field("vocab_size", &self.vocab.len())
-            .field("merges", &self.merges.len())
+            .field("vocab_size", &self.model.vocab_size())
+            .field("merges", &self.model.merge_count())
             .field("normalizer", &self.normalizer.name())
             .field("pattern", &self.pattern.as_str())
             .finish()
@@ -138,13 +136,12 @@ impl Tokenizer {
     /// it from `merges` — but the *size* is something a caller legitimately needs, e.g. to
     /// check an id before passing it to [`decode`](Tokenizer::decode).
     pub fn vocab_size(&self) -> usize {
-        self.vocab.len()
+        self.model.vocab_size()
     }
 
     pub fn with_config(pattern: &str, normalizer: Normalizer) -> Self {
         Tokenizer {
-            merges: HashMap::new(),
-            vocab: initial_vocab(),
+            model: BpeModel::untrained(),
             normalizer,
             pattern: PreTokenizer::new(pattern).expect("split pattern failed to compile"),
             special_tokens: HashMap::new(),
@@ -165,7 +162,7 @@ impl Tokenizer {
     /// - **non-empty** — an empty alternation branch matches at every position.
     /// - **ids unique** — two specials sharing an id makes `decode` ambiguous.
     pub fn register_special_tokens(&mut self, specials: &[(String, u32)]) -> Result<(), String> {
-        let floor = self.vocab.len() as u32;
+        let floor = self.model.vocab_size() as u32;
         let mut seen_ids: HashMap<u32, &str> = HashMap::new();
 
         for (token, id) in specials {
@@ -318,7 +315,7 @@ impl Tokenizer {
             // the lowest id is the earliest-learned merge. `None` is the `break` case.
             let best = stats
                 .keys()
-                .filter_map(|&pair| self.merges.get(&pair).map(|&idx| (idx, pair)))
+                .filter_map(|&pair| self.model.rank(pair).map(|idx| (idx, pair)))
                 .min();
 
             match best {
@@ -346,7 +343,7 @@ impl Tokenizer {
     pub fn decode(&self, ids: &[u32]) -> Result<String, String> {
         let mut tokens: Vec<u8> = Vec::new();
         for &idx in ids {
-            if let Some(bytes) = self.vocab.get(idx as usize) {
+            if let Some(bytes) = self.model.token(idx) {
                 tokens.extend_from_slice(bytes);
             } else if let Some(special) = self.inverse_special_tokens.get(&idx) {
                 tokens.extend_from_slice(special.as_bytes());
@@ -354,7 +351,7 @@ impl Tokenizer {
                 return Err(format!(
                     "unknown token id {idx}: this model has {} vocabulary entries and {} \
                      special tokens",
-                    self.vocab.len(),
+                    self.model.vocab_size(),
                     self.special_tokens.len()
                 ));
             }
@@ -466,7 +463,7 @@ mod tests {
         // `train`.
         let tok = trained();
         assert!(
-            !tok.merges.contains_key(&(101, 32)),
+            tok.model.rank((101, 32)).is_none(),
             "learned a merge spanning a word boundary"
         );
     }
@@ -480,8 +477,7 @@ mod tests {
         // The `(count, Reverse(pair))` key makes the maximum unique. This replaces
         // "run the binary twice and diff 5000 lines".
         let (a, b) = (trained(), trained());
-        assert_eq!(a.merges, b.merges);
-        assert_eq!(a.vocab, b.vocab);
+        assert!(a.model == b.model);
     }
 
     #[test]
@@ -501,8 +497,7 @@ mod tests {
         let mut ten_times = Tokenizer::new();
         ten_times.train(&base.repeat(10), 320, false);
 
-        assert_eq!(once.merges, ten_times.merges);
-        assert_eq!(once.vocab, ten_times.vocab);
+        assert!(once.model == ten_times.model);
     }
 
     #[test]
@@ -547,15 +542,15 @@ mod tests {
         a.train(&forward, 300, false);
         let mut b = Tokenizer::new();
         b.train(&backward, 300, false);
-        assert_eq!(a.merges, b.merges, "learned tables depend on chunk order");
+        assert!(a.model == b.model, "learned tables depend on chunk order");
     }
 
     #[test]
     fn training_to_vocab_size_256_learns_nothing() {
         let mut tok = Tokenizer::new();
         tok.train(&corpus(), 256, false);
-        assert!(tok.merges.is_empty());
-        assert_eq!(tok.vocab.len(), 256);
+        assert_eq!(tok.model.merge_count(), 0);
+        assert_eq!(tok.model.vocab_size(), 256);
     }
 
     #[test]
@@ -574,8 +569,12 @@ mod tests {
         // count. Asking for 44 more merges must stop at 2, not panic and not loop.
         let mut tok = Tokenizer::new();
         tok.train("a b c", 300, false);
-        assert_eq!(tok.merges.len(), 2, "should have run out of pairs after 2 merges");
-        assert_eq!(tok.vocab.len(), 258);
+        assert_eq!(
+            tok.model.merge_count(),
+            2,
+            "should have run out of pairs after 2 merges"
+        );
+        assert_eq!(tok.model.vocab_size(), 258);
     }
 
     #[test]
@@ -583,11 +582,16 @@ mod tests {
         // Ids are handed out 256, 257, ... as merges are learned, which is what lets the
         // id double as the merge rank and lets `vocab` be a Vec instead of a HashMap.
         let tok = trained();
-        assert_eq!(tok.vocab.len(), 256 + tok.merges.len());
+        assert_eq!(tok.model.vocab_size(), 256 + tok.model.merge_count());
 
-        let mut ids: Vec<u32> = tok.merges.values().copied().collect();
+        let mut ids: Vec<u32> = tok
+            .model
+            .merges_in_learned_order()
+            .into_iter()
+            .map(|(idx, _)| idx)
+            .collect();
         ids.sort_unstable();
-        let expected: Vec<u32> = (256..(256 + tok.merges.len() as u32)).collect();
+        let expected: Vec<u32> = (256..(256 + tok.model.merge_count() as u32)).collect();
         assert_eq!(ids, expected, "ids must be exactly 256..256+n with no gaps");
     }
 
@@ -597,10 +601,10 @@ mod tests {
         // `decode` relies on, and the reason vocab never needs to be stored on disk —
         // it can always be rebuilt by replaying the merges.
         let tok = trained();
-        for (&(p0, p1), &idx) in &tok.merges {
-            let mut expected = tok.vocab[p0 as usize].clone();
-            expected.extend_from_slice(&tok.vocab[p1 as usize]);
-            assert_eq!(tok.vocab[idx as usize], expected, "vocab[{idx}] is not p0 ++ p1");
+        for (idx, (p0, p1)) in tok.model.merges_in_learned_order() {
+            let mut expected = tok.model.token(p0).unwrap().to_vec();
+            expected.extend_from_slice(tok.model.token(p1).unwrap());
+            assert_eq!(tok.model.token(idx).unwrap(), expected, "vocab[{idx}] is not p0 ++ p1");
         }
     }
 
@@ -608,9 +612,9 @@ mod tests {
     fn every_byte_has_a_token_before_training() {
         // Why byte-level BPE has no out-of-vocabulary case.
         let tok = Tokenizer::new();
-        assert_eq!(tok.vocab.len(), 256);
+        assert_eq!(tok.model.vocab_size(), 256);
         for i in 0..256usize {
-            assert_eq!(tok.vocab[i], vec![i as u8]);
+            assert_eq!(tok.model.token(i as u32).unwrap(), [i as u8]);
         }
     }
 
@@ -678,7 +682,7 @@ mod tests {
         for w in ids.windows(2) {
             // Any pair still present in the output must be one `encode` could not merge.
             assert!(
-                !tok.merges.contains_key(&(w[0], w[1])),
+                tok.model.rank((w[0], w[1])).is_none(),
                 "encode stopped while a known merge {:?} was still applicable",
                 (w[0], w[1])
             );
@@ -761,8 +765,7 @@ mod tests {
 
         // `vocab` is NOT stored in the file — it is rebuilt by replaying the merges. That
         // it comes back identical is the proof that merges really are the ground truth.
-        assert_eq!(tok.merges, loaded.merges);
-        assert_eq!(tok.vocab, loaded.vocab);
+        assert!(tok.model == loaded.model);
         assert_eq!(tok.normalizer, loaded.normalizer);
         assert_eq!(tok.pattern.as_str(), loaded.pattern.as_str());
     }
@@ -832,10 +835,16 @@ mod tests {
         assert_eq!(lines[1], GPT4_SPLIT_PATTERN);
         assert_eq!(lines[2], "none");
         assert_eq!(lines[3], "0"); // special tokens, until step 8
-        assert_eq!(lines.len(), 4 + tok.merges.len());
+        assert_eq!(lines.len(), 4 + tok.model.merge_count());
 
         // Merge lines are in learned order, so line 4 is the first merge ever made.
-        let first = tok.merges.iter().find(|&(_, &idx)| idx == 256).unwrap().0;
+        let first = tok
+            .model
+            .merges_in_learned_order()
+            .into_iter()
+            .find(|&(idx, _)| idx == 256)
+            .unwrap()
+            .1;
         assert_eq!(lines[4], format!("{} {}", first.0, first.1));
     }
 
@@ -869,7 +878,7 @@ mod tests {
         let mut tok = Tokenizer::new();
         tok.train(&"a\n\n\nb\n\n\n".repeat(30), 300, false);
         assert!(
-            tok.vocab.iter().any(|v| v.len() > 1 && v.iter().all(|&b| b == b'\n')),
+            tok.model.tokens().any(|v| v.len() > 1 && v.iter().all(|&b| b == b'\n')),
             "expected the corpus to produce a newline-only token"
         );
 
@@ -880,7 +889,7 @@ mod tests {
         let text = fs::read_to_string(Path::new(&vocab_path)).unwrap();
 
         // 4 header comment lines + one line per token, and not one more.
-        assert_eq!(text.lines().count(), 4 + tok.vocab.len());
+        assert_eq!(text.lines().count(), 4 + tok.model.vocab_size());
     }
 
     // -- malformed models -------------------------------------------------------
@@ -1146,7 +1155,7 @@ mod tests {
         assert_eq!(lines[4], format!("<|endoftext|> {base}"));
         assert_eq!(lines[5], format!("<|fim_prefix|> {}", base + 1));
         // Two extra lines compared with a model that has none.
-        assert_eq!(lines.len(), 4 + 2 + tok.merges.len());
+        assert_eq!(lines.len(), 4 + 2 + tok.model.merge_count());
     }
 
     #[test]

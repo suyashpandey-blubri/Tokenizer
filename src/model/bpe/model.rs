@@ -34,8 +34,136 @@ pub(crate) const BYTE_ALPHABET: u32 = 256;
 /// Extracted because `with_config` and `load` held two verbatim copies of it. `load` is the
 /// one that matters: it must reconstruct *exactly* the state `train` started from, or
 /// replaying the merge list rebuilds a different table than the one that was saved.
-pub(crate) fn initial_vocab() -> Vec<Vec<u8>> {
+fn initial_vocab() -> Vec<Vec<u8>> {
     (0..BYTE_ALPHABET).map(|i| vec![i as u8]).collect()
+}
+
+/// A trained (or untrained) byte-pair vocabulary: the merge list and the table it derives.
+///
+/// WHY THIS IS A TYPE AND NOT TWO FIELDS ON `Tokenizer`
+/// ----------------------------------------------------
+/// The two fields are not independent. `vocab` is *derived* from `merges` — so completely
+/// that the `.model` file does not store it at all, and `load` rebuilds it by replaying the
+/// merge list. Any code that pushed to `vocab` without inserting into `merges` would break
+/// that silently, and every `.model` written afterwards would be wrong.
+///
+/// Before 12.3a that invariant was enforced by nothing. `lib.rs`, `trainer.rs` and
+/// `serialize.rs` could all reach both fields, and two of them carried their own hand-written
+/// copy of "mint an id, concatenate the two halves, push" — `train` deriving the id from its
+/// loop counter, `load` from its line index. Two independent statements of one rule, which
+/// is the same shape as the duplication 12.0 removed one level down.
+///
+/// Now the fields are private to this module and [`push_merge`](BpeModel::push_merge) is the
+/// only way to add anything, so the id cannot be derived wrongly and the two tables cannot
+/// drift apart.
+///
+/// `PartialEq` because several tests ask "did `load` reproduce what `train` built?" — which
+/// is the invariant stated as an assertion.
+///
+/// It is `pub(crate)`. Promoting it to public API would be the thing that finally lets a
+/// caller hold a trained model that provably cannot be retrained underneath them; that is a
+/// step-13 decision, and **12.3 does not deliver it** — from outside the crate nothing has
+/// changed.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct BpeModel {
+    /// (left_id, right_id) -> new_id. Ids are handed out 256, 257, ... in merge order, so
+    /// the id doubles as the merge rank — no separate ranks table needed.
+    merges: HashMap<(u32, u32), u32>,
+    /// vocab[id] = the byte string that id expands to. `Vec<u8>` is Python's `bytes`; a
+    /// token need not be valid UTF-8, because a merge can join half of a multi-byte
+    /// character to something else. Ids are dense 0..vocab_size, so a Vec indexed by id
+    /// beats a HashMap.
+    vocab: Vec<Vec<u8>>,
+}
+
+impl BpeModel {
+    /// The starting state: one token per possible byte, nothing learned.
+    ///
+    /// Note *untrained*, not *empty* — it already holds 256 tokens, which is exactly why
+    /// byte-level BPE has no out-of-vocabulary case. Both `Tokenizer::with_config` and
+    /// `load` begin here, and before 12.3a each assembled it from two halves by hand.
+    pub(crate) fn untrained() -> Self {
+        BpeModel {
+            merges: HashMap::new(),
+            vocab: initial_vocab(),
+        }
+    }
+
+    /// How many tokens this model knows: 256 byte tokens plus one per learned merge.
+    ///
+    /// A method rather than a public field because `.len()` needs `vocab` in scope, and
+    /// anything that can see `vocab` can also call `vocab.push` — which is the one thing
+    /// this type exists to prevent.
+    pub(crate) fn vocab_size(&self) -> usize {
+        self.vocab.len()
+    }
+
+    /// How many merges were learned. Equals `vocab_size() - BYTE_ALPHABET`, by construction.
+    pub(crate) fn merge_count(&self) -> usize {
+        self.merges.len()
+    }
+
+    /// The byte string an id expands to, or `None` if the id is out of range.
+    ///
+    /// `Option` rather than an index because `decode` takes ids from a file or a pipe, not
+    /// only from our own `encode`. Indexing directly was an out-of-bounds panic until step 8.
+    pub(crate) fn token(&self, id: u32) -> Option<&[u8]> {
+        self.vocab.get(id as usize).map(Vec::as_slice)
+    }
+
+    /// Every token in id order, for `.vocab` rendering.
+    pub(crate) fn tokens(&self) -> impl ExactSizeIterator<Item = &[u8]> {
+        self.vocab.iter().map(Vec::as_slice)
+    }
+
+    /// The id a pair merges into, or `None` if this pair was never learned.
+    ///
+    /// This is `encode`'s hot lookup, and the id it returns *is* the merge rank — which is
+    /// what lets `encode_chunk` pick "lowest id" to mean "earliest merge".
+    pub(crate) fn rank(&self, pair: (u32, u32)) -> Option<u32> {
+        self.merges.get(&pair).copied()
+    }
+
+    /// The merge list in the order training learned it, as `(new_id, (p0, p1))`.
+    ///
+    /// `merges` is a `HashMap` and has no order of its own. Sorting by the minted id
+    /// recovers it — and the order is not cosmetic: the `.model` file stores each new id
+    /// **implicitly, as the line index**, so writing the lines in a different order does not
+    /// produce a slightly different model, it produces a differently *trained* one, because
+    /// every later merge would then name different tokens.
+    pub(crate) fn merges_in_learned_order(&self) -> Vec<(u32, (u32, u32))> {
+        let mut by_id: Vec<(u32, (u32, u32))> =
+            self.merges.iter().map(|(&pair, &idx)| (idx, pair)).collect();
+        by_id.sort_unstable();
+        by_id
+    }
+
+    /// Learn one merge: mint the next id, derive its byte string, record both. Returns the
+    /// new id.
+    ///
+    /// **The only mutation this type allows**, and it deliberately does not let the caller
+    /// choose the id. `train` used to compute it from its loop counter and `load` from its
+    /// line index; here it comes from `merges.len()`, which cannot disagree with itself.
+    /// Building the byte string in the same call is what keeps `vocab` derived from
+    /// `merges` rather than merely consistent with it by habit.
+    ///
+    /// Because ids are appended as they are minted, they stay dense and in learned order by
+    /// construction — no separate vocab-building pass and nothing to sort.
+    ///
+    /// The next id is `vocab.len()`, **not** `BYTE_ALPHABET + merges.len()`. The two agree
+    /// on anything `train` produces, and they diverge on a corrupt `.model` that names the
+    /// same pair twice: `merges.insert` would overwrite and the count would not grow, so the
+    /// following merge would reuse an id that `vocab` had already handed out. `vocab.len()`
+    /// is the table's actual size and cannot drift from itself, which also matches what
+    /// `train` and `load` each computed by hand before 12.3a.
+    pub(crate) fn push_merge(&mut self, pair: (u32, u32)) -> u32 {
+        let idx = self.vocab.len() as u32;
+        self.merges.insert(pair, idx);
+        let mut bytes = self.vocab[pair.0 as usize].clone();
+        bytes.extend_from_slice(&self.vocab[pair.1 as usize]);
+        self.vocab.push(bytes);
+        idx
+    }
 }
 
 /// Counting all number of occurring pairs, accumulating into a caller-supplied map.
