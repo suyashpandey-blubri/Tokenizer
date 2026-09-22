@@ -21,7 +21,6 @@
 //! which is what makes it able to catch a forgotten `pub` — something a unit test in here
 //! structurally cannot notice.
 
-use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fmt;
@@ -31,7 +30,20 @@ use std::path::Path;
 use std::time::Instant;
 
 use fancy_regex::Regex;
-use unicode_normalization::UnicodeNormalization;
+
+mod text;
+
+// `pub use` is a `use` plus "and let callers outside the crate see it too". These three
+// are the items `main.rs` and `tests/api.rs` import by name, so re-exporting them here is
+// what keeps `naive_bbpe::Normalizer` resolving after the move — and it simultaneously
+// brings the short names into scope for this file, which uses all three itself.
+pub use text::normalizer::Normalizer;
+pub use text::pretokenizer::{GPT2_SPLIT_PATTERN, GPT4_SPLIT_PATTERN};
+
+// Plain `use`, because `PreTokenizer` is `pub(crate)`: only this file needs to name it,
+// as the type of a private field. `pub use` on it would not merely be redundant, it would
+// not compile — a `pub(crate)` item cannot be re-exported publicly.
+use text::pretokenizer::PreTokenizer;
 
 // ---------------------------------------------------------------------------
 // Pure helpers — no tokenizer state, so they stay free functions
@@ -293,71 +305,6 @@ fn invalid(message: impl Into<String>) -> io::Error {
 }
 
 // ---------------------------------------------------------------------------
-// Normalizer
-// ---------------------------------------------------------------------------
-
-/// The first pipeline stage. minbpe has no normalizer at all, and GPT-2/GPT-4 do no
-/// normalization, so `None` is the faithful default — this exists to demonstrate the
-/// stage. Note that anything other than `None` is LOSSY: it rewrites the text before
-/// encoding sees it, so `decode(encode(x)) == x` no longer holds. That is inherent, and
-/// is exactly why GPT-4 skips this stage.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Normalizer {
-    None,
-    Nfc,
-    Nfd,
-}
-
-impl Normalizer {
-    /// `Cow` = "clone on write": `None` hands back a borrow of the input and allocates
-    /// nothing, while Nfc/Nfd have to build a new String. Returning `String` would force
-    /// a full copy of the corpus even in the common no-op case.
-    pub fn normalize<'a>(&self, text: &'a str) -> Cow<'a, str> {
-        match self {
-            Normalizer::None => Cow::Borrowed(text),
-            Normalizer::Nfc => Cow::Owned(text.nfc().collect()),
-            Normalizer::Nfd => Cow::Owned(text.nfd().collect()),
-        }
-    }
-
-    /// The spelling used in a `.model` file and accepted by `--normalizer`.
-    pub fn name(&self) -> &'static str {
-        match self {
-            Normalizer::None => "none",
-            Normalizer::Nfc => "nfc",
-            Normalizer::Nfd => "nfd",
-        }
-    }
-
-    /// Inverse of [`name`](Normalizer::name). The normalizer must survive save/load: it
-    /// rewrites text before encoding, so loading a model without it would silently encode
-    /// differently from the tokenizer that was trained.
-    pub fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "none" => Some(Normalizer::None),
-            "nfc" => Some(Normalizer::Nfc),
-            "nfd" => Some(Normalizer::Nfd),
-            _ => None,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Pre-tokenizer patterns
-// ---------------------------------------------------------------------------
-
-// These need `fancy-regex`, not the std `regex` crate: `\s+(?!\S)` is a negative
-// lookahead and `\p{L}++` / `?+` are possessive quantifiers, neither of which a
-// finite-automata engine can do.
-//
-// Note a space attaches to the FOLLOWING word (` ?\p{L}+`), so "world!" splits as
-// [" world", "!"] and a pair like ("e", " ") can never occur inside one chunk.
-pub const GPT4_SPLIT_PATTERN: &str = r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+";
-
-// Kept for comparison: simpler, and it doesn't chop digits into groups of 3.
-pub const GPT2_SPLIT_PATTERN: &str = r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
-
-// ---------------------------------------------------------------------------
 // The tokenizer
 // ---------------------------------------------------------------------------
 
@@ -373,7 +320,7 @@ pub struct Tokenizer {
     /// Applied to the text before encoding. Defaults to `None`, matching GPT-4.
     normalizer: Normalizer,
     /// The pre-tokenizer, compiled once at construction rather than per call.
-    pattern: Regex,
+    pattern: PreTokenizer,
 
     /// Special tokens: `"<|endoftext|>" -> 100000`. These are NOT learned by training and
     /// are NOT in `vocab`. Their ids sit *above* `vocab.len()`, which is what stops one
@@ -451,7 +398,7 @@ impl Tokenizer {
             merges: HashMap::new(),
             vocab: initial_vocab(),
             normalizer,
-            pattern: Regex::new(pattern).expect("split pattern failed to compile"),
+            pattern: PreTokenizer::new(pattern).expect("split pattern failed to compile"),
             special_tokens: HashMap::new(),
             inverse_special_tokens: HashMap::new(),
             special_pattern: None,
@@ -539,10 +486,7 @@ impl Tokenizer {
     /// The pre-tokenizer stage: cut the text into chunks that BPE is not allowed to
     /// merge across.
     pub fn split<'a>(&self, text: &'a str) -> Vec<&'a str> {
-        self.pattern
-            .find_iter(text)
-            .map(|m| m.expect("regex match failed").as_str())
-            .collect()
+        self.pattern.split(text)
     }
 
     /// All of training, in one place: text in, both tables filled.
@@ -907,7 +851,7 @@ impl Tokenizer {
         }
         // `with_config` would panic on a pattern that does not compile. A corrupt file
         // must not be able to do that, so compile it here where the error is catchable.
-        let compiled = Regex::new(&pattern)
+        let compiled = PreTokenizer::new(&pattern)
             .map_err(|e| invalid(format!("split pattern does not compile: {e}")))?;
 
         let mut tok = Tokenizer {
@@ -1510,24 +1454,10 @@ mod tests {
     }
 
     // -- the normalizer ---------------------------------------------------------
-
-    #[test]
-    fn normalizer_none_borrows_instead_of_allocating() {
-        // The reason the return type is Cow: the common case copies nothing.
-        assert!(matches!(Normalizer::None.normalize("abc"), Cow::Borrowed(_)));
-        assert!(matches!(Normalizer::Nfc.normalize("abc"), Cow::Owned(_)));
-    }
-
-    #[test]
-    fn nfc_collapses_and_nfd_expands() {
-        let decomposed = "e\u{0301}"; // 'e' + combining acute, 3 bytes
-        let precomposed = "\u{00e9}"; // 'é' as one code point,  2 bytes
-        assert_eq!(Normalizer::Nfc.normalize(decomposed), precomposed);
-        assert_eq!(Normalizer::Nfd.normalize(precomposed), decomposed);
-        // ...and each leaves its own spelling alone.
-        assert_eq!(Normalizer::Nfc.normalize(precomposed), precomposed);
-        assert_eq!(Normalizer::Nfd.normalize(decomposed), decomposed);
-    }
+    //
+    // The two PURE `Normalizer` tests moved to `text/normalizer.rs` at 12.1, next to the
+    // code. These two stay because they are claims about a `Tokenizer` that happens to
+    // have a normalizer, not about the normalizer itself.
 
     #[test]
     fn normalization_breaks_the_round_trip_and_that_is_correct() {
