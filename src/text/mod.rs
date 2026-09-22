@@ -29,5 +29,6 @@
 //! Ours is one enum with three variants and 48 lines; a directory to hold it would be the
 //! same empty ceremony that downgraded `vocab/initializer.rs` to a constant at 12.0.
 
+pub mod boundary;
 pub mod normalizer;
 pub mod pretokenizer;

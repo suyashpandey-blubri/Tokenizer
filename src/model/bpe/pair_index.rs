@@ -24,6 +24,8 @@
 //! Both are avoided by recomputing the whole pair set of an affected chunk rather than
 //! hand-computing deltas. Chunks average ~6 ids, so recomputation costs nothing.
 
+use crate::text::boundary::{Boundaries, CorpusBoundaries};
+
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
@@ -32,9 +34,17 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 /// Note this counts *overlapping* occurrences: `[a,a,a]` yields `(a,a) -> 2`, even though
 /// `merge` will only replace one of them. That is deliberate and matches what the
 /// from-scratch loop counted, so the two agree.
-pub(crate) fn pairs_of(ids: &[u32]) -> HashMap<(u32, u32), i64> {
+pub(crate) fn pairs_of(ids: &[u32], bounds: &Boundaries) -> HashMap<(u32, u32), i64> {
     let mut pairs = HashMap::new();
-    for window in ids.windows(2) {
+    // `windows(2)` yields one window per GAP, so the window index IS the gap index:
+    // window `i` spans `ids[i] | ids[i+1]`. Skipping a forbidden gap here is the whole
+    // point of threading boundaries into COUNTING and not only into applying — an
+    // occurrence the trainer may not merge must not contribute to the pair's score, or
+    // the pair wins on evidence it cannot act on and the ranking is silently wrong.
+    for (gap, window) in ids.windows(2).enumerate() {
+        if !bounds.permits(gap) {
+            continue;
+        }
         *pairs.entry((window[0], window[1])).or_insert(0) += 1;
     }
     pairs
@@ -90,12 +100,12 @@ pub(crate) struct PairIndex {
 }
 
 impl PairIndex {
-    pub(crate) fn build(chunks: &[Vec<u32>], counts: &[u64]) -> Self {
+    pub(crate) fn build(chunks: &[Vec<u32>], counts: &[u64], bounds: &CorpusBoundaries) -> Self {
         let mut stats: HashMap<(u32, u32), i64> = HashMap::new();
         let mut where_: HashMap<(u32, u32), HashSet<usize>> = HashMap::new();
 
         for (i, (chunk, &weight)) in chunks.iter().zip(counts).enumerate() {
-            for (pair, n) in pairs_of(chunk) {
+            for (pair, n) in pairs_of(chunk, bounds.for_chunk(i)) {
                 *stats.entry(pair).or_insert(0) += n * weight as i64;
                 where_.entry(pair).or_default().insert(i);
             }
@@ -131,9 +141,20 @@ impl PairIndex {
     }
 
     /// Record that chunk `index` changed from `old` to `new`.
-    pub(crate) fn apply_chunk_change(&mut self, index: usize, old: &[u32], new: &[u32], weight: u64) {
-        let before = pairs_of(old);
-        let after = pairs_of(new);
+    /// `old_bounds` and `new_bounds` are the gap masks before and after the merge. They
+    /// differ once 12.4b makes `merge` shrink the mask alongside the chunk; until then the
+    /// caller passes the same `Unrestricted` for both.
+    pub(crate) fn apply_chunk_change(
+        &mut self,
+        index: usize,
+        old: &[u32],
+        old_bounds: &Boundaries,
+        new: &[u32],
+        new_bounds: &Boundaries,
+        weight: u64,
+    ) {
+        let before = pairs_of(old, old_bounds);
+        let after = pairs_of(new, new_bounds);
         let weight = weight as i64;
 
         for (&pair, &n) in &before {
@@ -171,8 +192,14 @@ impl PairIndex {
     /// O(corpus) so it is never run during real training — only from tests, on corpora
     /// small enough that running it after *every* merge is still instant.
     #[cfg(test)]
-    pub(crate) fn assert_consistent(&self, chunks: &[Vec<u32>], counts: &[u64], after: &str) {
-        let fresh = PairIndex::build(chunks, counts);
+    pub(crate) fn assert_consistent(
+        &self,
+        chunks: &[Vec<u32>],
+        counts: &[u64],
+        bounds: &CorpusBoundaries,
+        after: &str,
+    ) {
+        let fresh = PairIndex::build(chunks, counts, bounds);
         assert_eq!(self.stats, fresh.stats, "stats drifted after {after}");
         assert_eq!(self.where_, fresh.where_, "where_ drifted after {after}");
     }
@@ -192,17 +219,75 @@ mod tests {
     fn pairs_of_counts_overlapping_occurrences() {
         // Deliberately counts overlaps, matching what the from-scratch loop counted.
         // `merge` will only replace two of the three, but that is a different question.
-        assert_eq!(pairs_of(&[97, 97, 97, 97]).get(&(97, 97)), Some(&3));
-        assert_eq!(pairs_of(&[1, 2, 3]).len(), 2);
-        assert!(pairs_of(&[1]).is_empty());
-        assert!(pairs_of(&[]).is_empty());
+        assert_eq!(pairs_of(&[97, 97, 97, 97], &Boundaries::Unrestricted).get(&(97, 97)), Some(&3));
+        assert_eq!(pairs_of(&[1, 2, 3], &Boundaries::Unrestricted).len(), 2);
+        assert!(pairs_of(&[1], &Boundaries::Unrestricted).is_empty());
+        assert!(pairs_of(&[], &Boundaries::Unrestricted).is_empty());
+    }
+
+    /// THE LIVE-SEAM TEST for counting. Everything production does today passes
+    /// `Unrestricted`, so without this the boundary threading would compile, pass every
+    /// other test, and be **completely inert** — a seam nobody had shown to do anything.
+    ///
+    /// This is the half of B3 that fails *silently* if it is missed. Suppose gap 1 is
+    /// forbidden but `pairs_of` counts it anyway: the trainer sees `(97, 97)` occurring
+    /// three times, ranks it first on that evidence, and then `merge` legally applies only
+    /// two of them. The winner was chosen on occurrences it was never allowed to touch, and
+    /// nothing crashes — the vocabulary is just quietly worse.
+    #[test]
+    fn a_forbidden_gap_is_not_counted() {
+        //   ids:   [97][97][97][97]
+        //   gaps:     0   1   2
+        let ids = [97, 97, 97, 97];
+        assert_eq!(
+            pairs_of(&ids, &Boundaries::Unrestricted).get(&(97, 97)),
+            Some(&3),
+            "sanity: all three gaps counted when nothing is forbidden"
+        );
+
+        let one_forbidden = Boundaries::Mask(vec![true, false, true]);
+        assert_eq!(
+            pairs_of(&ids, &one_forbidden).get(&(97, 97)),
+            Some(&2),
+            "forbidding gap 1 must drop the count to 2"
+        );
+
+        let all_forbidden = Boundaries::Mask(vec![false, false, false]);
+        assert!(
+            pairs_of(&ids, &all_forbidden).is_empty(),
+            "a chunk with every gap forbidden contributes no pairs at all"
+        );
+    }
+
+    /// The same claim one level up: a forbidden gap must not reach `stats` or `where_`
+    /// either, or `pop_best` would still rank on it.
+    #[test]
+    fn pair_index_build_respects_forbidden_gaps() {
+        let chunks = vec![vec![97, 97, 97, 97]];
+        let counts = vec![10];
+
+        let open = PairIndex::build(&chunks, &counts, &CorpusBoundaries::AllUnrestricted);
+        assert_eq!(open.stats.get(&(97, 97)), Some(&30), "3 gaps x weight 10");
+
+        let restricted = CorpusBoundaries::PerChunk(vec![Boundaries::Mask(vec![
+            true, false, true,
+        ])]);
+        let closed = PairIndex::build(&chunks, &counts, &restricted);
+        assert_eq!(closed.stats.get(&(97, 97)), Some(&20), "2 gaps x weight 10");
+
+        let shut = CorpusBoundaries::PerChunk(vec![Boundaries::Mask(vec![false; 3])]);
+        let none = PairIndex::build(&chunks, &counts, &shut);
+        assert!(
+            none.stats.is_empty() && none.where_.is_empty(),
+            "nothing counted means nothing indexed"
+        );
     }
 
     #[test]
     fn pair_index_build_weights_by_chunk_count() {
         let chunks = vec![vec![1, 2], vec![1, 2]];
         let counts = vec![10, 5];
-        let index = PairIndex::build(&chunks, &counts);
+        let index = PairIndex::build(&chunks, &counts, &CorpusBoundaries::AllUnrestricted);
         assert_eq!(index.stats.get(&(1, 2)), Some(&15));
         assert_eq!(index.where_[&(1, 2)], [0, 1].into_iter().collect());
     }
@@ -211,7 +296,7 @@ mod tests {
     fn pop_best_returns_the_highest_count_with_ties_to_the_smallest_pair() {
         let chunks = vec![vec![1, 2], vec![3, 4], vec![5, 6]];
         let counts = vec![10, 10, 3]; // (1,2) and (3,4) tie at 10
-        let mut index = PairIndex::build(&chunks, &counts);
+        let mut index = PairIndex::build(&chunks, &counts, &CorpusBoundaries::AllUnrestricted);
         // The step-2 tie-break rule, now expressed as a heap ordering.
         assert_eq!(index.pop_best(), Some((1, 2)));
     }
@@ -222,14 +307,28 @@ mod tests {
         // popping must notice and use the current value rather than the stale one.
         let chunks = vec![vec![1, 2], vec![3, 4]];
         let counts = vec![5, 3];
-        let mut index = PairIndex::build(&chunks, &counts);
+        let mut index = PairIndex::build(&chunks, &counts, &CorpusBoundaries::AllUnrestricted);
 
         // (1,2) disappears from chunk 0, which should demote it below (3,4).
-        index.apply_chunk_change(0, &[1, 2], &[9], 5);
+        index.apply_chunk_change(
+            0,
+            &[1, 2],
+            &Boundaries::Unrestricted,
+            &[9],
+            &Boundaries::Unrestricted,
+            5,
+        );
         assert_eq!(index.pop_best(), Some((3, 4)), "a stale entry won the pop");
 
         // And a pair that is gone entirely is skipped rather than returned with count 0.
-        index.apply_chunk_change(1, &[3, 4], &[9], 3);
+        index.apply_chunk_change(
+            1,
+            &[3, 4],
+            &Boundaries::Unrestricted,
+            &[9],
+            &Boundaries::Unrestricted,
+            3,
+        );
         assert_eq!(index.pop_best(), None);
     }
 
@@ -240,13 +339,25 @@ mod tests {
         // neighbours; recomputing the whole pair set cannot.
         let chunks = vec![vec![7, 1, 1, 8]];
         let counts = vec![1];
-        let mut index = PairIndex::build(&chunks, &counts);
+        let mut index = PairIndex::build(&chunks, &counts, &CorpusBoundaries::AllUnrestricted);
 
         let merged = merge(&chunks[0], (1, 1), 256);
         assert_eq!(merged, vec![7, 256, 8]);
-        index.apply_chunk_change(0, &chunks[0], &merged, 1);
+        index.apply_chunk_change(
+            0,
+            &chunks[0],
+            &Boundaries::Unrestricted,
+            &merged,
+            &Boundaries::Unrestricted,
+            1,
+        );
 
-        index.assert_consistent(&[merged], &counts, "a neighbour-pair merge");
+        index.assert_consistent(
+            &[merged],
+            &counts,
+            &CorpusBoundaries::AllUnrestricted,
+            "a neighbour-pair merge",
+        );
         for gone in [(7, 1), (1, 1), (1, 8)] {
             assert!(!index.stats.contains_key(&gone), "{gone:?} should be gone");
         }
@@ -261,14 +372,26 @@ mod tests {
         // recomputes rather than subtracting one per replacement.
         let chunks = vec![vec![1, 1, 1, 1]];
         let counts = vec![4];
-        let mut index = PairIndex::build(&chunks, &counts);
+        let mut index = PairIndex::build(&chunks, &counts, &CorpusBoundaries::AllUnrestricted);
         assert_eq!(index.stats.get(&(1, 1)), Some(&12)); // 3 occurrences x weight 4
 
         let merged = merge(&chunks[0], (1, 1), 256);
         assert_eq!(merged, vec![256, 256]);
-        index.apply_chunk_change(0, &chunks[0], &merged, 4);
+        index.apply_chunk_change(
+            0,
+            &chunks[0],
+            &Boundaries::Unrestricted,
+            &merged,
+            &Boundaries::Unrestricted,
+            4,
+        );
 
-        index.assert_consistent(&[merged], &counts, "an overlapping-run merge");
+        index.assert_consistent(
+            &[merged],
+            &counts,
+            &CorpusBoundaries::AllUnrestricted,
+            "an overlapping-run merge",
+        );
         assert!(!index.stats.contains_key(&(1, 1)));
         assert_eq!(index.stats.get(&(256, 256)), Some(&4));
     }

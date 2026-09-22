@@ -37,6 +37,7 @@ use std::time::Instant;
 use crate::Tokenizer;
 use crate::model::bpe::model::{BYTE_ALPHABET, BpeModel, merge};
 use crate::model::bpe::pair_index::PairIndex;
+use crate::text::boundary::CorpusBoundaries;
 // `render_token` lives in `serialize.rs` — `write_vocab` is its main caller. The trainer
 // uses it only for the sampled verbose report.
 use crate::model::bpe::serialize::render_token;
@@ -76,7 +77,15 @@ impl BpeTrainer {
     ///
     /// Takes `chunks` by value because it rewrites them in place on every merge, and the
     /// caller has no use for them afterwards.
-    pub(crate) fn train(&self, mut chunks: Vec<Vec<u32>>, counts: Vec<u64>) -> BpeModel {
+    /// `bounds[i]` says which gaps inside `chunks[i]` a merge may cross. Today every entry
+    /// is `Unrestricted` — B0 forbids nothing — and the equivalence gate is what proves the
+    /// threading is inert. 15.4 is where non-trivial masks start arriving.
+    pub(crate) fn train(
+        &self,
+        mut chunks: Vec<Vec<u32>>,
+        bounds: CorpusBoundaries,
+        counts: Vec<u64>,
+    ) -> BpeModel {
         let mut model = BpeModel::untrained();
         let new_tokens = self.target_vocab_size - BYTE_ALPHABET;
 
@@ -90,7 +99,7 @@ impl BpeTrainer {
         // Pair counts, the chunk index and the priority queue, built once and then kept
         // up to date. Before step 10 the equivalent of `stats` was rebuilt from scratch on
         // every iteration by scanning every chunk.
-        let mut index = PairIndex::build(&chunks, &counts);
+        let mut index = PairIndex::build(&chunks, &counts, &bounds);
 
         for i in 0..new_tokens {
             // Python: `max(stats, key=stats.get)` — but taken off a heap rather than by
@@ -130,11 +139,14 @@ impl BpeTrainer {
             for ci in index.chunks_containing((p0, p1)) {
                 let old = std::mem::take(&mut chunks[ci]);
                 let new = merge(&old, (p0, p1), idx);
-                index.apply_chunk_change(ci, &old, &new, counts[ci]);
+                // Same `bounds[ci]` twice until 12.4b teaches `merge` to shrink the mask
+                // alongside the chunk. Correct for `Unrestricted`, which has no length.
+                let b = bounds.for_chunk(ci);
+                index.apply_chunk_change(ci, &old, b, &new, b, counts[ci]);
                 chunks[ci] = new;
             }
             #[cfg(test)]
-            index.assert_consistent(&chunks, &counts, &format!("merging {:?}", (p0, p1)));
+            index.assert_consistent(&chunks, &counts, &bounds, &format!("merging {:?}", (p0, p1)));
 
             if self.verbose && (i == 0 || i + 1 == new_tokens || (i + 1) % report_every == 0) {
                 println!(
@@ -208,6 +220,9 @@ impl Tokenizer {
             );
         }
 
-        self.model = trainer.train(chunks, counts);
+        // Boundaries are derived from TEXT, so this loop — the one place the chunk text is
+        // still in hand — is where 15.4 will build real masks. B0 forbids nothing, and
+        // `AllUnrestricted` says so without allocating anything per chunk.
+        self.model = trainer.train(chunks, CorpusBoundaries::AllUnrestricted, counts);
     }
 }
