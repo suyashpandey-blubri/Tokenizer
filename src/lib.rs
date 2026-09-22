@@ -23,10 +23,6 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::fs;
-use std::io::{self, BufWriter, Write};
-use std::path::Path;
-use std::time::Instant;
 
 use fancy_regex::Regex;
 
@@ -35,11 +31,13 @@ mod text;
 
 // Moved into `model/bpe/` at 12.2a. They need `pub(crate)` there and a `use` here for the
 // same reason: a private item is visible in its own module and all DESCENDANTS of it, so
-// `lib.rs` — the parent — cannot see into a child. (The reverse holds too, which is why
-// `impl Tokenizer` blocks can move down at 12.2b with no visibility change at all: the
-// fields are declared here, and `model/bpe/` is a descendant.)
-use model::bpe::model::{BYTE_ALPHABET, get_stats_into, initial_vocab, merge};
-use model::bpe::pair_index::PairIndex;
+// `lib.rs` — the parent — cannot see into a child.
+//
+// The reverse direction is why 12.2b could move `train`, `save` and `load` out of this file
+// with NO visibility change at all: they are `impl Tokenizer` blocks, the fields are
+// declared here, and `model/bpe/` is a descendant. What is left in this file after that is
+// the type itself, the encode path, and special tokens.
+use model::bpe::model::{get_stats_into, initial_vocab, merge};
 
 // `pub use` is a `use` plus "and let callers outside the crate see it too". These three
 // are the items `main.rs` and `tests/api.rs` import by name, so re-exporting them here is
@@ -53,50 +51,6 @@ pub use text::pretokenizer::{GPT2_SPLIT_PATTERN, GPT4_SPLIT_PATTERN};
 // not compile — a `pub(crate)` item cannot be re-exported publicly.
 use text::pretokenizer::PreTokenizer;
 
-// ---------------------------------------------------------------------------
-// Serialization helpers — moving to model/bpe/serialize.rs at 12.2b
-// ---------------------------------------------------------------------------
-
-/// Render a token's byte string for display. Two things can go wrong, and both are handled
-/// here rather than at each call site.
-///
-/// **The bytes need not be valid UTF-8.** A merge can join the first half of a multi-byte
-/// character to something else — merge 262 in the demo corpus was `(226, 128)`, two bytes
-/// from the middle of a UTF-8 sequence. Those become the replacement character U+FFFD.
-/// Seeing "\u{fffd}" in a vocab file is expected, not a bug, and it is the reason `vocab`
-/// is `Vec<Vec<u8>>` and not `Vec<String>` — a `String` could not hold that token at all.
-///
-/// **The bytes may contain control characters.** A token containing a newline would split
-/// one `.vocab` entry across two lines and quietly corrupt the file's one-entry-per-line
-/// shape, so control characters are escaped as `\uXXXX`.
-///
-/// This is minbpe's `render_token` / `replace_control_characters`, with one deliberate
-/// narrowing: minbpe escapes every character in Unicode category C, which needs
-/// `unicodedata`. `char::is_control` covers category Cc only — C0 and C1, which is every
-/// character that can actually break the file format. Format characters like U+200D ZERO
-/// WIDTH JOINER (category Cf) are left as-is here and would be escaped by minbpe. Since
-/// `.vocab` is never parsed, the difference is cosmetic.
-fn render_token(bytes: &[u8]) -> String {
-    let mut out = String::new();
-    for ch in String::from_utf8_lossy(bytes).chars() {
-        if ch.is_control() {
-            out.push_str(&format!("\\u{:04x}", ch as u32));
-        } else {
-            out.push(ch);
-        }
-    }
-    out
-}
-
-/// Line 1 of every `.model` file. A file that does not start with this is not ours, and
-/// saying so beats failing later with a confusing parse error.
-const MODEL_HEADER: &str = "naive_bbpe v1";
-
-/// Every failure in `load` is a malformed file rather than a bug, so they all become
-/// `InvalidData` errors carrying an explanation.
-fn invalid(message: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message.into())
-}
 
 // ---------------------------------------------------------------------------
 // The tokenizer
@@ -283,124 +237,6 @@ impl Tokenizer {
         self.pattern.split(text)
     }
 
-    /// All of training, in one place: text in, both tables filled.
-    pub fn train(&mut self, text: &str, vocab_size: u32, verbose: bool) {
-        assert!(
-            vocab_size >= BYTE_ALPHABET,
-            "vocab_size must leave room for the 256 byte tokens"
-        );
-        let new_tokens = vocab_size - BYTE_ALPHABET;
-
-        // `verbose` used to print one line per merge. That was fine for 20 merges and is
-        // useless for 49744 — so it now reports roughly 20 times over the whole run,
-        // always including the first and last. Elapsed time matters more than the merge
-        // itself once a run is measured in minutes: it is the only way to tell a slow
-        // run from a hung one.
-        let started = Instant::now();
-        let report_every = (new_tokens / 20).max(1);
-
-        let text = self.normalizer.normalize(text);
-
-        // Pre-tokenize, then DEDUPLICATE. Merges are applied within a chunk and never
-        // across one, so no token can span a boundary — that part is unchanged. What is
-        // new is that identical chunks are collapsed.
-        //
-        // Natural text is enormously repetitive: 1 GB of English pre-tokenizes to roughly
-        // 200 million chunks but only ~3 million *distinct* ones, because `" the"` alone
-        // occurs tens of millions of times. Storing and re-processing every copy on every
-        // iteration is the same work done over and over for no new information.
-        //
-        // Tallying into a `HashMap<&str, u64>` borrows from `text`, so the chunk strings
-        // themselves are never copied — only counted.
-        let mut tally: HashMap<&str, u64> = HashMap::new();
-        let mut total_chunks: u64 = 0;
-        for chunk in self.split(&text) {
-            *tally.entry(chunk).or_insert(0) += 1;
-            total_chunks += 1;
-        }
-
-        // Two parallel vectors rather than a map of chunk -> count: `merge` rebuilds the
-        // ids on every iteration, and rebuilding a HashMap's keys is far more expensive
-        // than rewriting a Vec in place. `counts[i]` belongs to `chunks[i]`.
-        let mut chunks: Vec<Vec<u32>> = Vec::with_capacity(tally.len());
-        let mut counts: Vec<u64> = Vec::with_capacity(tally.len());
-        for (chunk, count) in tally {
-            chunks.push(chunk.bytes().map(|b| b as u32).collect());
-            counts.push(count);
-        }
-
-        if verbose {
-            println!(
-                "  pre-tokenized into {total_chunks} chunks, {} unique ({:.1}x less work)",
-                chunks.len(),
-                total_chunks as f64 / chunks.len().max(1) as f64,
-            );
-        }
-
-        // Pair counts, the chunk index and the priority queue, built once and then kept
-        // up to date. Before step 10 the equivalent of `stats` was rebuilt from scratch on
-        // every iteration by scanning every chunk.
-        let mut index = PairIndex::build(&chunks, &counts);
-
-        for i in 0..new_tokens {
-            // Python: `max(stats, key=stats.get)` — but taken off a heap rather than by
-            // scanning, because `stats` has millions of entries and scanning it 50,000
-            // times is minutes of work on its own.
-            //
-            // The ordering has not changed: it is still "highest count, ties to the
-            // smallest pair", the rule introduced in step 2 because Rust HashMaps have no
-            // iteration order and ties had to break deterministically.
-            let Some((p0, p1)) = index.pop_best() else {
-                // Reachable because chunks are short: they can all shrink to length 1.
-                if verbose {
-                    println!(
-                        "no pairs left; stopping early at vocab size {}",
-                        BYTE_ALPHABET + i
-                    );
-                }
-                break;
-            };
-
-            let idx = BYTE_ALPHABET + i; // this is our new token
-
-            // Only the chunks that actually contain this pair are touched. Everything else
-            // is untouched and its contribution to `stats` stays correct — which is the
-            // entire point of the step.
-            //
-            // `counts` is never touched: merging rewrites what a chunk contains, never how
-            // many times it occurs, so the two vectors stay aligned by construction.
-            for ci in index.chunks_containing((p0, p1)) {
-                let old = std::mem::take(&mut chunks[ci]);
-                let new = merge(&old, (p0, p1), idx);
-                index.apply_chunk_change(ci, &old, &new, counts[ci]);
-                chunks[ci] = new;
-            }
-            #[cfg(test)]
-            index.assert_consistent(&chunks, &counts, &format!("merging {:?}", (p0, p1)));
-
-            self.merges.insert((p0, p1), idx);
-
-            // Build this token's byte string immediately, while we still have the pair
-            // in hand. Because we append as we mint, ids stay dense and in order by
-            // construction — no separate vocab-building pass, and nothing to sort.
-            let mut bytes = self.vocab[p0 as usize].clone();
-            bytes.extend_from_slice(&self.vocab[p1 as usize]);
-            self.vocab.push(bytes);
-
-            if verbose && (i == 0 || i + 1 == new_tokens || (i + 1) % report_every == 0) {
-                println!(
-                    "  merge {:>6}/{}  {:>5} + {:<5} -> {:<5} {:>12}  [{:.1}s]",
-                    i + 1,
-                    new_tokens,
-                    p0,
-                    p1,
-                    idx,
-                    format!("{:?}", render_token(&self.vocab[idx as usize])),
-                    started.elapsed().as_secs_f64(),
-                );
-            }
-        }
-    }
 
     /// Encode text with **no regard for special tokens** — `<|endoftext|>` comes out as
     /// those 13 ordinary characters. This is the whole encode pipeline as it existed before
@@ -495,211 +331,6 @@ impl Tokenizer {
 
     // -- persistence ------------------------------------------------------------
 
-    /// Write `<prefix>.model` and `<prefix>.vocab`.
-    ///
-    /// This is where `dump_tables` went. It was print-only scaffolding that showed the two
-    /// tables on stdout; the same information is now a pair of files that outlive the
-    /// process, which is the entire point of the step.
-    ///
-    /// The two files have completely different jobs:
-    ///
-    /// - **`.model`** is the real artifact. `load` reads it and nothing else.
-    /// - **`.vocab`** is for humans and is *never read back*. It exists so you can look at
-    ///   what training produced without writing a program. minbpe does the same.
-    pub fn save(&self, prefix: &Path) -> io::Result<()> {
-        // Append rather than `Path::with_extension`, which would REPLACE an existing
-        // extension: `with_extension` on "models/fw.v2" gives "models/fw.model", losing
-        // the ".v2". Appending gives "models/fw.v2.model", which is what anyone typing
-        // that prefix meant.
-        let mut model_path = prefix.as_os_str().to_owned();
-        model_path.push(".model");
-        let mut vocab_path = prefix.as_os_str().to_owned();
-        vocab_path.push(".vocab");
-
-        self.write_model(&mut BufWriter::new(fs::File::create(&model_path)?))?;
-        self.write_vocab(&mut BufWriter::new(fs::File::create(&vocab_path)?))?;
-        Ok(())
-    }
-
-    /// The machine-readable half. Format, version 1:
-    ///
-    /// ```text
-    /// naive_bbpe v1          <- header, so a wrong file fails loudly
-    /// <pattern>              <- the pre-tokenizer regex, verbatim
-    /// <normalizer>           <- none | nfc | nfd
-    /// <num_special>          <- always 0 until step 8, but the field exists now so
-    ///                           adding special tokens will not change the format version
-    /// <token> <id>           x num_special
-    /// <p0> <p1>              x num_merges, in learned order
-    /// ```
-    ///
-    /// **Vocab is deliberately not stored.** Merges are the ground truth; vocab is derived
-    /// from them by concatenation, so writing it down would be storing the same information
-    /// twice and inviting the two copies to disagree. `load` rebuilds it by replaying the
-    /// merge lines — the exact loop `train` already runs.
-    ///
-    /// The new id is implicit too: it is `256 + line_index`, because ids are handed out in
-    /// merge order. That is the same fact that lets `encode` use "lowest id" to mean
-    /// "earliest merge".
-    fn write_model(&self, out: &mut impl Write) -> io::Result<()> {
-        writeln!(out, "{MODEL_HEADER}")?;
-        writeln!(out, "{}", self.pattern.as_str())?;
-        writeln!(out, "{}", self.normalizer.name())?;
-        let specials = self.special_tokens();
-        writeln!(out, "{}", specials.len())?;
-        for (token, id) in specials {
-            writeln!(out, "{token} {id}")?;
-        }
-
-        for (_, (p0, p1)) in self.merges_in_learned_order() {
-            writeln!(out, "{p0} {p1}")?;
-        }
-        Ok(())
-    }
-
-    /// The human-readable half. Never parsed, so the format is free to be whatever is
-    /// easiest to read. Control characters are escaped by [`render_token`], without which
-    /// a token containing a newline would silently split one entry across two lines.
-    fn write_vocab(&self, out: &mut impl Write) -> io::Result<()> {
-        writeln!(out, "# naive_bbpe vocabulary — for reading, never loaded back")?;
-        writeln!(out, "# pattern:    {}", self.pattern.as_str())?;
-        writeln!(out, "# normalizer: {}", self.normalizer.name())?;
-        writeln!(
-            out,
-            "# {} entries: 256 byte tokens + {} learned",
-            self.vocab.len(),
-            self.merges.len()
-        )?;
-
-        // id -> the pair it was built from, for the learned half.
-        let parents: HashMap<u32, (u32, u32)> =
-            self.merges.iter().map(|(&pair, &idx)| (idx, pair)).collect();
-
-        for (idx, bytes) in self.vocab.iter().enumerate() {
-            let rendered = render_token(bytes);
-            match parents.get(&(idx as u32)) {
-                // A learned token: show what it was built from, so the file reads as a
-                // history of the merges rather than a flat list.
-                Some(&(p0, p1)) => writeln!(
-                    out,
-                    "{idx}\t[{rendered}]\t= [{}] + [{}]",
-                    render_token(&self.vocab[p0 as usize]),
-                    render_token(&self.vocab[p1 as usize]),
-                )?,
-                // One of the 256 byte tokens.
-                None => writeln!(out, "{idx}\t[{rendered}]")?,
-            }
-        }
-        Ok(())
-    }
-
-    /// `merges` is a HashMap and has no order of its own. Sorting by the minted id
-    /// recovers the order training created them in.
-    fn merges_in_learned_order(&self) -> Vec<(u32, (u32, u32))> {
-        let mut by_id: Vec<(u32, (u32, u32))> =
-            self.merges.iter().map(|(&pair, &idx)| (idx, pair)).collect();
-        by_id.sort_unstable();
-        by_id
-    }
-
-    /// Read a `<prefix>.model` written by [`save`](Tokenizer::save).
-    ///
-    /// Every failure here is a malformed *file*, not a bug, so they come back as
-    /// `io::ErrorKind::InvalidData` rather than a panic — a corrupt model should print a
-    /// message, not abort the process.
-    pub fn load(path: &Path) -> io::Result<Self> {
-        let text = fs::read_to_string(path)?;
-        let mut lines = text.lines();
-
-        let mut next = |what: &str| -> io::Result<&str> {
-            lines.next().ok_or_else(|| invalid(format!("file ended before {what}")))
-        };
-
-        let header = next("the header")?;
-        if header != MODEL_HEADER {
-            return Err(invalid(format!(
-                "not a naive_bbpe model: expected {MODEL_HEADER:?} on line 1, found {header:?}"
-            )));
-        }
-
-        let pattern = next("the split pattern")?.to_string();
-        let normalizer_name = next("the normalizer")?;
-        let normalizer = Normalizer::from_name(normalizer_name)
-            .ok_or_else(|| invalid(format!("unknown normalizer: {normalizer_name:?}")))?;
-
-        let raw = next("the special-token count")?;
-        let num_special: usize = raw
-            .trim()
-            .parse()
-            .map_err(|_| invalid(format!("special-token count is not a number: {raw:?}")))?;
-        let mut special_tokens = Vec::with_capacity(num_special);
-        for _ in 0..num_special {
-            let line = next("a special token")?;
-            let (token, id) = line
-                .rsplit_once(' ')
-                .ok_or_else(|| invalid(format!("malformed special token line: {line:?}")))?;
-            let id: u32 = id
-                .parse()
-                .map_err(|_| invalid(format!("special token id is not a number: {id:?}")))?;
-            special_tokens.push((token.to_string(), id));
-        }
-        // `with_config` would panic on a pattern that does not compile. A corrupt file
-        // must not be able to do that, so compile it here where the error is catchable.
-        let compiled = PreTokenizer::new(&pattern)
-            .map_err(|e| invalid(format!("split pattern does not compile: {e}")))?;
-
-        let mut tok = Tokenizer {
-            merges: HashMap::new(),
-            vocab: initial_vocab(),
-            normalizer,
-            pattern: compiled,
-            // Registered further down, once the merges have been replayed:
-            // `register_special_tokens` validates ids against `vocab.len()`, which is not
-            // final until then.
-            special_tokens: HashMap::new(),
-            inverse_special_tokens: HashMap::new(),
-            special_pattern: None,
-        };
-
-        // Replay the merges in file order, rebuilding vocab as we go — exactly what
-        // `train` does as it learns them.
-        for (i, line) in lines.enumerate() {
-            let line_no = i + 5 + num_special;
-            let (a, b) = line
-                .split_once(' ')
-                .ok_or_else(|| invalid(format!("line {line_no}: expected \"<p0> <p1>\", found {line:?}")))?;
-            let parse = |s: &str| -> io::Result<u32> {
-                s.trim()
-                    .parse::<u32>()
-                    .map_err(|_| invalid(format!("line {line_no}: not a token id: {s:?}")))
-            };
-            let (p0, p1) = (parse(a)?, parse(b)?);
-
-            // A merge can only refer to tokens that already exist. Without this check a
-            // corrupt file would index out of bounds and panic.
-            let known = tok.vocab.len() as u32;
-            if p0 >= known || p1 >= known {
-                return Err(invalid(format!(
-                    "line {line_no}: merge ({p0}, {p1}) refers to a token that does not exist yet \
-                     (only 0..{known} are defined at that point)"
-                )));
-            }
-
-            let idx = BYTE_ALPHABET + i as u32;
-            tok.merges.insert((p0, p1), idx);
-            let mut bytes = tok.vocab[p0 as usize].clone();
-            bytes.extend_from_slice(&tok.vocab[p1 as usize]);
-            tok.vocab.push(bytes);
-        }
-
-        // Now that vocab is complete, the "id must not shadow a learned token" check is
-        // meaningful. Doing it here also validates the file: a model claiming a special at
-        // id 300 in a 2000-token vocabulary is corrupt, and this is what says so.
-        tok.register_special_tokens(&special_tokens)
-            .map_err(|e| invalid(format!("invalid special token in model file: {e}")))?;
-
-        Ok(tok)
-    }
 
     /// Python: `b"".join(vocab[idx] for idx in ids).decode('utf-8', errors='replace')`
     ///
@@ -752,6 +383,21 @@ impl Tokenizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // These were crate-root imports until 12.2b. The production code in this file no longer
+    // touches the filesystem — `save`/`load` live in `model/bpe/serialize.rs` now — but the
+    // persistence tests DELIBERATELY stayed here, because they drive `tok.save()` and
+    // `Tokenizer::load()` (claims about the public type, not about the writer), and their
+    // helpers are shared with the special-tokens section below. So the imports follow them
+    // into the test module rather than staying at the crate root where they would be dead.
+    use std::fs;
+    use std::io;
+    use std::path::Path;
+
+    // `a_merged_token_need_not_be_valid_utf8` asserts that a token can be invalid UTF-8,
+    // which is a fact about `vocab`, not about serialization — so it stays here and reaches
+    // across for the renderer.
+    use crate::model::bpe::serialize::render_token;
 
     /// A small, repetitive corpus. Deliberately NOT `TEXT`: a test that learns 1744 merges
     /// is a slow test, and slow tests get skipped. 900 bytes is enough for every property
@@ -1214,15 +860,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn render_token_escapes_control_characters() {
-        // Without escaping, a token containing a newline would split one `.vocab` entry
-        // across two lines and quietly corrupt the file's shape.
-        assert_eq!(render_token(b"a\nb"), "a\\u000ab");
-        assert_eq!(render_token(b"\t"), "\\u0009");
-        assert_eq!(render_token(&[226, 128]), "\u{fffd}"); // invalid UTF-8, not a control
-        assert_eq!(render_token(b"hi"), "hi");
-    }
 
     #[test]
     fn the_vocab_file_stays_one_line_per_token_even_with_newline_tokens() {

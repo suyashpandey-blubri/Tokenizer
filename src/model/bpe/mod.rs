@@ -2,3 +2,5 @@
 
 pub(crate) mod model;
 pub(crate) mod pair_index;
+pub(crate) mod serialize;
+pub(crate) mod trainer;
