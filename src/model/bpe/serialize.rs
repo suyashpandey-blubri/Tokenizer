@@ -43,6 +43,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
 use crate::model::bpe::model::BpeModel;
+use crate::special_tokens::SpecialTokens;
 use crate::text::pretokenizer::PreTokenizer;
 use crate::{Normalizer, Tokenizer};
 
@@ -239,9 +240,7 @@ impl Tokenizer {
             // Registered further down, once the merges have been replayed:
             // `register_special_tokens` validates ids against `vocab.len()`, which is not
             // final until then.
-            special_tokens: HashMap::new(),
-            inverse_special_tokens: HashMap::new(),
-            special_pattern: None,
+            specials: SpecialTokens::none(),
         };
 
         // Replay the merges in file order, rebuilding vocab as we go — exactly what

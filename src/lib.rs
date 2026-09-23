@@ -24,8 +24,6 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use fancy_regex::Regex;
-
 mod model;
 mod special_tokens;
 mod text;
@@ -37,7 +35,8 @@ mod text;
 // The reverse direction is why 12.2b could move `train`, `save` and `load` out of this file
 // with NO visibility change at all: they are `impl Tokenizer` blocks, the fields are
 // declared here, and `model/bpe/` is a descendant. What is left in this file after that is
-// the type itself, the encode path, and special tokens.
+// the type itself, the encode and decode paths, and the public special-token methods — whose
+// state has lived in `special_tokens.rs` since 12.8b.
 use model::bpe::model::{BpeModel, get_stats_into, merge};
 use text::boundary::Boundaries;
 
@@ -53,11 +52,11 @@ pub use text::pretokenizer::{GPT2_SPLIT_PATTERN, GPT4_SPLIT_PATTERN};
 // not compile — a `pub(crate)` item cannot be re-exported publicly.
 use text::pretokenizer::PreTokenizer;
 
-// Moved at 12.8a, and split the same two ways as above: `AllowedSpecial` is public API that
-// `main.rs` and `tests/api.rs` import by name, so it is re-exported; `compile_special_pattern`
-// is `pub(crate)` and only `register_special_tokens` calls it.
+// Split the same two ways as above: `AllowedSpecial` (12.8a) is public API that `main.rs` and
+// `tests/api.rs` import by name, so it is re-exported; `SpecialTokens` (12.8b) is
+// `pub(crate)`, the type of a private field.
 pub use special_tokens::AllowedSpecial;
-use special_tokens::compile_special_pattern;
+use special_tokens::SpecialTokens;
 
 
 // ---------------------------------------------------------------------------
@@ -77,16 +76,9 @@ pub struct Tokenizer {
     /// The pre-tokenizer, compiled once at construction rather than per call.
     pattern: PreTokenizer,
 
-    /// Special tokens: `"<|endoftext|>" -> 100000`. These are NOT learned by training and
-    /// are NOT in `vocab`. Their ids sit *above* `vocab.len()`, which is what stops one
-    /// from shadowing a token BPE actually learned.
-    special_tokens: HashMap<String, u32>,
-    /// The reverse direction, for `decode`. Kept as a second map rather than searched
-    /// linearly because `decode` looks up every single id it is given.
-    inverse_special_tokens: HashMap<u32, String>,
-    /// An alternation of the escaped special tokens, compiled once. `None` when there are
-    /// no specials, which is also the signal for `encode` to skip the whole stage.
-    special_pattern: Option<Regex>,
+    /// Special tokens, both directions plus the regex that finds them. One field rather than
+    /// three since 12.8b, for the same reason as `model` — see [`SpecialTokens`].
+    specials: SpecialTokens,
 }
 
 /// Deriving `Debug` would print every one of `vocab`'s entries — 2000 of them after a
@@ -134,9 +126,7 @@ impl Tokenizer {
             model: BpeModel::untrained(),
             normalizer,
             pattern: PreTokenizer::new(pattern).expect("split pattern failed to compile"),
-            special_tokens: HashMap::new(),
-            inverse_special_tokens: HashMap::new(),
-            special_pattern: None,
+            specials: SpecialTokens::none(),
         }
     }
 
@@ -152,43 +142,15 @@ impl Tokenizer {
     /// - **non-empty** — an empty alternation branch matches at every position.
     /// - **ids unique** — two specials sharing an id makes `decode` ambiguous.
     pub fn register_special_tokens(&mut self, specials: &[(String, u32)]) -> Result<(), String> {
-        let floor = self.model.vocab_size() as u32;
-        let mut seen_ids: HashMap<u32, &str> = HashMap::new();
-
-        for (token, id) in specials {
-            if token.is_empty() {
-                return Err("a special token cannot be empty".to_string());
-            }
-            if token.contains('\n') || token.contains('\r') {
-                return Err(format!(
-                    "special token {token:?} contains a line break, which the .model format \
-                     cannot represent"
-                ));
-            }
-            if *id < floor {
-                return Err(format!(
-                    "special token {token:?} has id {id}, which would shadow a learned token \
-                     (ids below {floor} are already taken by the vocabulary)"
-                ));
-            }
-            if let Some(other) = seen_ids.insert(*id, token) {
-                return Err(format!("special tokens {other:?} and {token:?} share id {id}"));
-            }
-        }
-
-        self.special_tokens = specials.iter().cloned().collect();
-        self.inverse_special_tokens =
-            specials.iter().map(|(t, i)| (*i, t.clone())).collect();
-        self.special_pattern = compile_special_pattern(specials);
+        // `?` returns before the assignment, so a rejected registration leaves the previous
+        // specials in place — as it did when the three fields were assigned one by one.
+        self.specials = SpecialTokens::new(specials, self.model.vocab_size() as u32)?;
         Ok(())
     }
 
     /// The registered special tokens, lowest id first.
     pub fn special_tokens(&self) -> Vec<(String, u32)> {
-        let mut v: Vec<(String, u32)> =
-            self.special_tokens.iter().map(|(t, &i)| (t.clone(), i)).collect();
-        v.sort_by_key(|(_, i)| *i);
-        v
+        self.specials.list()
     }
 
     /// The pre-tokenizer stage: cut the text into chunks that BPE is not allowed to
@@ -221,7 +183,7 @@ impl Tokenizer {
     /// actually appears in the text.
     pub fn encode(&self, text: &str, allowed: AllowedSpecial) -> Result<Vec<u32>, String> {
         // No specials registered, or none permitted: the fast path is also the whole path.
-        let Some(pattern) = self.special_pattern.as_ref() else {
+        let Some(pattern) = self.specials.pattern() else {
             return Ok(self.encode_ordinary(text));
         };
         match allowed {
@@ -252,7 +214,7 @@ impl Tokenizer {
                 ids.extend(self.encode_ordinary(&text[cursor..m.start()]));
             }
             // `find_iter` only yields matches of the alternation, so this is always a hit.
-            ids.push(self.special_tokens[m.as_str()]);
+            ids.push(self.specials.id(m.as_str()));
             cursor = m.end();
         }
         if cursor < text.len() {
@@ -318,14 +280,14 @@ impl Tokenizer {
         for &idx in ids {
             if let Some(bytes) = self.model.token(idx) {
                 tokens.extend_from_slice(bytes);
-            } else if let Some(special) = self.inverse_special_tokens.get(&idx) {
+            } else if let Some(special) = self.specials.token(idx) {
                 tokens.extend_from_slice(special.as_bytes());
             } else {
                 return Err(format!(
                     "unknown token id {idx}: this model has {} vocabulary entries and {} \
                      special tokens",
                     self.model.vocab_size(),
-                    self.special_tokens.len()
+                    self.specials.len()
                 ));
             }
         }
@@ -1139,6 +1101,26 @@ mod tests {
         assert!(e.contains("unknown token id"), "unhelpful message: {e}");
         // The gap between the vocabulary and the first special is invalid too.
         assert!(tok.decode(&[tok.vocab_size() as u32 + 50]).is_err());
+    }
+
+    #[test]
+    fn special_tokens_are_listed_lowest_id_first() {
+        // The order is not cosmetic: `save` writes the specials in this order, so without the
+        // sort `.model` files would come out in HashMap order and stop being reproducible.
+        // Added at 12.8b, when mutating the sort away was caught only by luck — 5 runs in 12
+        // — because every other test registers two or three specials, and two entries come
+        // out of a HashMap already sorted half the time.
+        //
+        // Twenty, registered in a scrambled order (7 is coprime to 20, so `i * 7 % 20` visits
+        // every offset once). A random order passes by chance about once in 20! ≈ 2.4e18.
+        let mut tok = trained();
+        let base = tok.vocab_size() as u32;
+        let specials: Vec<(String, u32)> =
+            (0..20u32).map(|i| (format!("<|s{i}|>"), base + (i * 7) % 20)).collect();
+        tok.register_special_tokens(&specials).unwrap();
+
+        let ids: Vec<u32> = tok.special_tokens().iter().map(|&(_, id)| id).collect();
+        assert_eq!(ids, (base..base + 20).collect::<Vec<_>>());
     }
 
     #[test]
