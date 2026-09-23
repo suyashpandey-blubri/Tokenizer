@@ -235,3 +235,56 @@ impl Tokenizer {
         self.model = trainer.train(chunks, CorpusBoundaries::AllUnrestricted, counts);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::text::boundary::Boundaries;
+
+    /// THE LIVE-SEAM TEST for the training loop itself — added at 12.6, because the
+    /// post-12.4b audit showed three mutations of this loop that no test noticed. Every
+    /// other caller goes through `Tokenizer::train`, which always passes `AllUnrestricted`,
+    /// so this has to call `BpeTrainer::train` directly to hand it a real mask.
+    ///
+    /// ```text
+    ///   ids:   [a][a][a][a]
+    ///   gaps:     0  1  2
+    ///   mask:     x  ok x
+    /// ```
+    ///
+    /// `(a, a)` has exactly one permitted occurrence, so it is merged once, into
+    /// `[a][aa][a]`. Both remaining gaps are still forbidden, so training stops at ONE merge.
+    /// Without the mask the same chunk trains two (`aa`, then `aaaa`).
+    ///
+    /// What each mutation does to this, and what notices:
+    ///
+    /// - **merge is handed `Unrestricted` instead of the mask** — it crosses the forbidden
+    ///   gaps and trains exactly as if there were no mask: two merges. The merge list says so.
+    /// - **the new mask is never written back** — the chunk is now 3 ids with 2 gaps but is
+    ///   still paired with the old 3-gap mask. `assert_consistent` recounts after the merge
+    ///   under that stale mask, disagrees with the running totals, and panics.
+    /// - **the new chunk is counted under the OLD mask** — old gap 1 is permitted, so
+    ///   `(aa, a)` gets counted when it should not. The recount disagrees; left to run, it
+    ///   would also learn a second merge.
+    #[test]
+    fn training_respects_a_mask_across_merges() {
+        let a = 97;
+        let chunk = vec![a, a, a, a];
+        let trainer = BpeTrainer::new(BYTE_ALPHABET + 4, false); // room for 4; needs fewer
+
+        let open = trainer.train(vec![chunk.clone()], CorpusBoundaries::AllUnrestricted, vec![1]);
+        assert_eq!(
+            open.merges_in_learned_order(),
+            vec![(256, (a, a)), (257, (256, 256))],
+            "sanity: with nothing forbidden, aaaa trains aa then aaaa"
+        );
+
+        let masked = CorpusBoundaries::PerChunk(vec![Boundaries::Mask(vec![false, true, false])]);
+        let restricted = trainer.train(vec![chunk], masked, vec![1]);
+        assert_eq!(
+            restricted.merges_in_learned_order(),
+            vec![(256, (a, a))],
+            "only the middle gap may be merged, so exactly one merge is possible"
+        );
+    }
+}

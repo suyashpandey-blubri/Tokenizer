@@ -284,6 +284,32 @@ mod tests {
         );
     }
 
+    /// Each chunk must be counted under ITS OWN mask. Added at 12.6: the test above has a
+    /// single chunk, so reading chunk 0's mask for every chunk was invisible to it — the
+    /// post-12.4b audit showed that mutation passing every test.
+    #[test]
+    fn pair_index_build_uses_each_chunks_own_mask() {
+        // Two identical chunks, two different masks. Only chunk 0 has permitted gaps.
+        let chunks = vec![vec![97, 97, 97, 97], vec![97, 97, 97, 97]];
+        let counts = vec![1, 1];
+        let bounds = CorpusBoundaries::PerChunk(vec![
+            Boundaries::Mask(vec![true, false, true]),
+            Boundaries::Mask(vec![false, false, false]),
+        ]);
+
+        let index = PairIndex::build(&chunks, &counts, &bounds);
+        assert_eq!(
+            index.stats.get(&(97, 97)),
+            Some(&2),
+            "2 permitted gaps in chunk 0, none in chunk 1 — 4 means chunk 0's mask was reused"
+        );
+        assert_eq!(
+            index.where_[&(97, 97)],
+            [0].into_iter().collect(),
+            "chunk 1 contributes nothing, so it must not be indexed"
+        );
+    }
+
     #[test]
     fn pair_index_build_weights_by_chunk_count() {
         let chunks = vec![vec![1, 2], vec![1, 2]];

@@ -492,6 +492,31 @@ mod tests {
     }
 
     #[test]
+    fn training_again_replaces_what_was_learned() {
+        // Pins a behaviour step 12 changed WITHOUT meaning to, found by the post-12.4b
+        // audit. Before 12.3b a second `train` kept the old merges and numbered the new ones
+        // from 256 again, so two tokens shared each id and decode returned garbage. Since
+        // 12.3b it replaces the model, which is correct — and nothing in the repo retrains,
+        // so without this test the old behaviour could come back unnoticed.
+        //
+        // Public methods only, on purpose: that lets the same test be run against the
+        // pre-step-12 code, where it fails.
+        let second = "pack my box with five dozen liquor jugs. ".repeat(20);
+
+        let mut retrained = Tokenizer::new();
+        retrained.train(&corpus(), 320, false);
+        retrained.train(&second, 300, false);
+
+        let mut fresh = Tokenizer::new();
+        fresh.train(&second, 300, false);
+
+        assert_eq!(retrained.vocab_size(), fresh.vocab_size(), "the first run's merges survived");
+        let ids = retrained.encode_ordinary(&second);
+        assert_eq!(ids, fresh.encode_ordinary(&second));
+        assert_eq!(retrained.decode(&ids).unwrap(), second);
+    }
+
+    #[test]
     fn repeating_the_corpus_does_not_change_what_is_learned() {
         // The strongest available check on the weighting, because it is a property rather
         // than a fixture: repeating a corpus multiplies every chunk count by the same
@@ -964,6 +989,27 @@ mod tests {
         let e = load_from_text("forward_ref", &text).unwrap_err();
         assert_eq!(e.kind(), io::ErrorKind::InvalidData);
         assert!(e.to_string().contains("does not exist yet"), "{e}");
+    }
+
+    #[test]
+    fn a_model_file_that_repeats_a_pair_still_round_trips() {
+        // The ONE corrupt file in this section that `load` accepts rather than rejects:
+        // nothing checks for a merge line that repeats an earlier one. Rejecting it is a
+        // behaviour change, deferred to step 13. Until then this pins what it does today.
+        //
+        // It is also the reason `push_merge` mints `vocab.len()` and NOT
+        // `BYTE_ALPHABET + merges.len()`. The repeated pair overwrites its map entry, so
+        // `merges.len()` stops growing: with the wrong rule the third merge would be given
+        // id 257 — already `aa` — and "bb" would decode as "aa". Added at 12.6; the
+        // post-12.4b audit showed that mutation passing every test.
+        let text = format!("naive_bbpe v1\n{GPT4_SPLIT_PATTERN}\nnone\n0\n97 97\n97 97\n98 98\n");
+        let tok = load_from_text("repeated_pair", &text).unwrap();
+
+        assert_eq!(tok.vocab_size(), 259, "256 bytes + three merge lines");
+        let ids = tok.encode_ordinary("bb");
+        assert_eq!(ids, vec![258], "bb is the third merge line, so id 258");
+        assert_eq!(tok.decode(&ids).unwrap(), "bb");
+        assert_eq!(tok.decode(&tok.encode_ordinary("aa")).unwrap(), "aa");
     }
 
     // -- special tokens ---------------------------------------------------------
