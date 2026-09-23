@@ -27,6 +27,7 @@ use std::fmt;
 use fancy_regex::Regex;
 
 mod model;
+mod special_tokens;
 mod text;
 
 // Moved into `model/bpe/` at 12.2a. They need `pub(crate)` there and a `use` here for the
@@ -51,6 +52,12 @@ pub use text::pretokenizer::{GPT2_SPLIT_PATTERN, GPT4_SPLIT_PATTERN};
 // as the type of a private field. `pub use` on it would not merely be redundant, it would
 // not compile — a `pub(crate)` item cannot be re-exported publicly.
 use text::pretokenizer::PreTokenizer;
+
+// Moved at 12.8a, and split the same two ways as above: `AllowedSpecial` is public API that
+// `main.rs` and `tests/api.rs` import by name, so it is re-exported; `compile_special_pattern`
+// is `pub(crate)` and only `register_special_tokens` calls it.
+pub use special_tokens::AllowedSpecial;
+use special_tokens::compile_special_pattern;
 
 
 // ---------------------------------------------------------------------------
@@ -80,25 +87,6 @@ pub struct Tokenizer {
     /// An alternation of the escaped special tokens, compiled once. `None` when there are
     /// no specials, which is also the signal for `encode` to skip the whole stage.
     special_pattern: Option<Regex>,
-}
-
-/// What `encode` should do when a special token appears literally in the input text.
-/// These are minbpe's three `allowed_special` policies.
-///
-/// The distinction matters because a special token is just *text* until someone decides it
-/// is not. If a user's document genuinely contains the characters `<|endoftext|>`, treating
-/// it as a document boundary silently corrupts their data — and treating it as text when it
-/// was meant as a boundary silently corrupts the training run. There is no safe default, so
-/// the caller has to say.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum AllowedSpecial {
-    /// Recognise every registered special token. What you want when you built the file.
-    All,
-    /// Recognise none of them; `<|endoftext|>` encodes as those 13 ordinary characters.
-    None,
-    /// Recognise none of them, but fail loudly if one appears. minbpe's default, and the
-    /// only option that cannot silently do the wrong thing.
-    NoneRaise,
 }
 
 /// Deriving `Debug` would print every one of `vocab`'s entries — 2000 of them after a
@@ -191,35 +179,8 @@ impl Tokenizer {
         self.special_tokens = specials.iter().cloned().collect();
         self.inverse_special_tokens =
             specials.iter().map(|(t, i)| (*i, t.clone())).collect();
-        self.special_pattern = Self::compile_special_pattern(specials);
+        self.special_pattern = compile_special_pattern(specials);
         Ok(())
-    }
-
-    /// Build the alternation used to find special tokens in text.
-    ///
-    /// Two details that are easy to get wrong:
-    ///
-    /// - **Escaping.** A special token is a literal string, but it is going into a regex.
-    ///   `<|endoftext|>` contains `|`, which is regex alternation — unescaped, that pattern
-    ///   would match the empty string everywhere. `fancy_regex::escape` handles it, so no
-    ///   new dependency is needed.
-    /// - **Longest first.** Regex alternation is first-match, not longest-match. With
-    ///   `<|end|>` listed before `<|endoftext|>`, the text `<|endoftext|>` would match the
-    ///   short one and leave `oftext|>` behind as ordinary text. Sorting by descending
-    ///   length makes the longer token win.
-    fn compile_special_pattern(specials: &[(String, u32)]) -> Option<Regex> {
-        if specials.is_empty() {
-            return None;
-        }
-        let mut tokens: Vec<&String> = specials.iter().map(|(t, _)| t).collect();
-        tokens.sort_by_key(|t| std::cmp::Reverse(t.len()));
-        let alternation = tokens
-            .iter()
-            .map(|t| fancy_regex::escape(t).into_owned())
-            .collect::<Vec<_>>()
-            .join("|");
-        // Cannot fail: every branch is an escaped literal.
-        Some(Regex::new(&alternation).expect("escaped literals always compile"))
     }
 
     /// The registered special tokens, lowest id first.
