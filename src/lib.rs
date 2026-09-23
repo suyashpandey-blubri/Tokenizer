@@ -57,12 +57,13 @@ use text::pretokenizer::PreTokenizer;
 // The tokenizer
 // ---------------------------------------------------------------------------
 
-/// The two tables BPE is made of. `train` writes both; `encode` reads `merges` and
-/// `decode` reads `vocab`. Bundling them is the only reason this type exists.
+/// A trained byte-level BPE tokenizer: the learned merges, the text pipeline in front of them
+/// (normalizer and pre-tokenizer), and any special tokens. `train` builds the merges,
+/// `encode` and `decode` use them, and `save` and `load` persist all of it.
 pub struct Tokenizer {
     /// What training produced: the merge list and the table derived from it. One field
     /// rather than two since 12.3a, because the two were never independent — see
-    /// [`BpeModel`](crate::model::bpe::model::BpeModel).
+    /// [`BpeModel`].
     model: BpeModel,
     /// Applied to the text before encoding. Defaults to `None`, matching GPT-4.
     normalizer: Normalizer,

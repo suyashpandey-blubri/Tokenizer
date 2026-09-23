@@ -13,8 +13,9 @@
 //! `pairs_of` is NOT here despite looking like a sibling of `get_stats_into`: measured at
 //! 12.2, its only three call sites are all inside `impl PairIndex`, so it lives there.
 //!
-//! At 12.3 these become inherent methods on `BpeModel`. They are free functions today
-//! because that is what they were in `lib.rs`, and 12.2 moves code without changing it.
+//! `merge` and `get_stats_into` stay free functions. Neither reads `BpeModel`'s tables —
+//! `merge` is handed the new id, and `get_stats_into` only counts — so as methods they would
+//! have access they never use.
 
 use std::collections::HashMap;
 
@@ -62,16 +63,16 @@ fn initial_vocab() -> Vec<Vec<u8>> {
 /// `PartialEq` because several tests ask "did `load` reproduce what `train` built?" — which
 /// is the invariant stated as an assertion.
 ///
-/// It is `pub(crate)`. Promoting it to public API would be the thing that finally lets a
-/// caller hold a trained model that provably cannot be retrained underneath them; that is a
-/// step-13 decision, and **12.3 does not deliver it** — from outside the crate nothing has
-/// changed.
+/// It is `pub(crate)`. Making it public — so a signature like `fn fertility(m: &BpeModel)`
+/// can say it needs the trained artifact and nothing else — is a step-13 decision. From
+/// outside the crate the API is unchanged; the one behaviour that did change is that a
+/// second `train` now replaces the model instead of corrupting it.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct BpeModel {
     /// (left_id, right_id) -> new_id. Ids are handed out 256, 257, ... in merge order, so
     /// the id doubles as the merge rank — no separate ranks table needed.
     merges: HashMap<(u32, u32), u32>,
-    /// vocab[id] = the byte string that id expands to. `Vec<u8>` is Python's `bytes`; a
+    /// `vocab[id]` = the byte string that id expands to. `Vec<u8>` is Python's `bytes`; a
     /// token need not be valid UTF-8, because a merge can join half of a multi-byte
     /// character to something else. Ids are dense 0..vocab_size, so a Vec indexed by id
     /// beats a HashMap.
@@ -145,7 +146,7 @@ impl BpeModel {
     ///
     /// **The only mutation this type allows**, and it deliberately does not let the caller
     /// choose the id. `train` used to compute it from its loop counter and `load` from its
-    /// line index; here it comes from `merges.len()`, which cannot disagree with itself.
+    /// line index; here it comes from `vocab.len()`, which cannot disagree with itself.
     /// Building the byte string in the same call is what keeps `vocab` derived from
     /// `merges` rather than merely consistent with it by habit.
     ///

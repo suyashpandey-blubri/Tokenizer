@@ -64,8 +64,8 @@ pub(crate) fn pairs_of(ids: &[u32], bounds: &Boundaries) -> HashMap<(u32, u32), 
 ///
 /// A from-scratch `stats` **cannot be stale**; this one is correct only if every update is.
 /// A missed update does not crash — it silently picks slightly wrong winners and trains a
-/// subtly worse tokenizer. [`Self::assert_consistent`] exists to make that failure loud in
-/// tests, and the step's real check is that `.model` files come out byte-identical.
+/// subtly worse tokenizer. `Self::assert_consistent` (test builds only) exists to make that
+/// failure loud in tests, and the step's real check is that `.model` files come out byte-identical.
 ///
 /// # The simplification that removes most of the risk
 ///

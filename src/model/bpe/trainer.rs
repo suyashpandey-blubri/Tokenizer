@@ -182,7 +182,7 @@ impl Tokenizer {
     ///
     /// This half is the *text* pipeline — normalize, pre-tokenize, deduplicate — and the
     /// byte-to-id conversion at its end is the boundary between `text/` and `model/`. The
-    /// merge loop itself is [`BpeTrainer::train`].
+    /// merge loop itself is `BpeTrainer::train`.
     pub fn train(&mut self, text: &str, vocab_size: u32, verbose: bool) {
         // Constructed first because it starts the clock, and the verbose report's elapsed
         // times are meant to include normalization and pre-tokenization. It also carries

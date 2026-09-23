@@ -28,14 +28,15 @@
 //!
 //! Merging `(b, c)` consumes gap 1 and the chunk becomes `[a][bc][d]` with gaps `0, 1` —
 //! where the new gap 1 is the old gap 2. So applying a merge **removes the gap it crossed**
-//! and renumbers everything to its right. [`Boundaries::after_merge`] is where that happens
-//! (12.4b).
+//! and renumbers everything to its right. [`merge`](crate::model::bpe::model::merge) is where
+//! that happens: it returns the rewritten ids and their renumbered mask together (12.4b).
 //!
 //! IF THIS TURNS OUT TO BE THE WRONG ABSTRACTION
 //! ----------------------------------------------
 //! Removing it is a bounded edit, deliberately: this file, the `bounds` parameter on
-//! `pairs_of` / `merge` / `PairIndex`, and one `Vec<Boundaries>` in `BpeTrainer`. Nothing
-//! else knows it exists, and `Tokenizer`'s public API does not mention it. Written down
+//! `pairs_of` / `get_stats_into` / `merge` / `PairIndex`, the `CorpusBoundaries` argument to
+//! `BpeTrainer::train`, and the two lines that pass in the unrestricted case
+//! (`Tokenizer::train`, `encode_chunk`). Nothing else knows it exists, and `Tokenizer`'s public API does not mention it. Written down
 //! because step 15's research may well redefine what a boundary has to express, and this
 //! seam should not become load-bearing by accident.
 
