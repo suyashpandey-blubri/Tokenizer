@@ -46,6 +46,10 @@ TRAIN OPTIONS:
     --special <TOK>[=ID]  register a special token; repeatable
                           ID defaults to the next free slot at or above vocab-size
     --verbose             report training progress
+    --no-report           skip re-reading the input after training to print
+                          compression and round trip (the model is saved either way)
+    --threads <N>         how many blocks of input to count at once; the model is
+                          identical for any N           [default: all cores, at most 64]
 
 ENCODE OPTIONS:
     --allow-special <P>   all | none | none-raise                [default: none-raise]
@@ -102,6 +106,13 @@ struct TrainArgs {
     /// vocab_size is known rather than at parse time.
     specials: Vec<(String, Option<u32>)>,
     verbose: bool,
+    /// Re-read the input after training to print compression and round trip. On by
+    /// default; `--no-report` turns it off, because on a production corpus that second
+    /// pass takes longer than training itself (prod.2).
+    report: bool,
+    /// How many blocks are counted at the same time (prod.3). Only speed and memory
+    /// depend on it; the model does not.
+    threads: usize,
 }
 
 /// Every value-taking flag needs the same "is there actually a next argument?" check.
@@ -217,6 +228,8 @@ fn parse_train(args: &[String]) -> Result<Command, String> {
     let mut normalizer = Normalizer::None;
     let mut specials: Vec<(String, Option<u32>)> = Vec::new();
     let mut verbose = false;
+    let mut report = true;
+    let mut threads = default_threads();
 
     // Flags that take a value need the NEXT element too, so this is a while loop with a
     // manual index rather than a `for`: some arms advance by 2 and some by 1.
@@ -259,6 +272,18 @@ fn parse_train(args: &[String]) -> Result<Command, String> {
                 verbose = true;
                 i += 1;
             }
+            "--no-report" => {
+                report = false;
+                i += 1;
+            }
+            "--threads" => {
+                let raw = value_of(args, i, "--threads")?;
+                threads = match raw.parse::<usize>() {
+                    Ok(n) if n >= 1 => n,
+                    _ => return Err(format!("--threads expects a number of at least 1, got {raw:?}")),
+                };
+                i += 2;
+            }
             "-h" | "--help" => return Ok(Command::Help),
             other => return Err(format!("unknown flag: {other:?}")),
         }
@@ -292,7 +317,22 @@ fn parse_train(args: &[String]) -> Result<Command, String> {
         normalizer,
         specials,
         verbose,
+        report,
+        threads,
     }))
+}
+
+/// `--threads` when it is not given: every core this machine reports, but at most 64.
+///
+/// Measured at prod.3 on 1 GB: ~97% of counting runs in parallel and ~3% (reading the file,
+/// combining the threads' tallies) does not, so past ~64 threads the time barely falls while
+/// memory — a block or two in flight per thread — keeps rising. A DEFAULT only: an explicit
+/// `--threads 512` is used as given.
+fn default_threads() -> usize {
+    const DEFAULT_MAX_THREADS: usize = 64;
+    std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(DEFAULT_MAX_THREADS)
 }
 
 // ---------------------------------------------------------------------------
@@ -309,20 +349,27 @@ fn run_train(args: TrainArgs) -> Result<(), Box<dyn Error>> {
     // a real corpus it costs the whole run.
     check_output_writable(&args.out)?;
 
-    // The whole file into memory as one String, which also validates it as UTF-8.
-    let text = fs::read_to_string(&args.input)
-        .map_err(|e| format!("could not read {}: {e}", args.input.display()))?;
+    // The input is READ IN BLOCKS, never whole (prod.1): a production corpus is far larger
+    // than memory. Opening it here, before anything is printed, still makes a missing file
+    // the first thing reported. UTF-8 is checked block by block as training reads it.
+    let read_error = |e: io::Error| format!("could not read {}: {e}", args.input.display());
+    let input = fs::File::open(&args.input).map_err(read_error)?;
+    // Bytes only — the size on disk is free, while counting characters (as this line did
+    // until prod.1) would mean one extra pass over the whole corpus before training starts.
+    let input_bytes = input.metadata().map_err(read_error)?.len();
 
     println!("input:      {}", args.input.display());
-    println!("            {} bytes, {} chars", text.len(), text.chars().count());
+    println!("            {input_bytes} bytes");
     println!("vocab size: {}  ({} merges to learn)", args.vocab_size, args.vocab_size - 256);
     println!("pattern:    {}", args.pattern_name);
     println!("normalizer: {}", args.normalizer.name());
+    println!("threads:    {}", args.threads);
     println!();
 
     let mut tok = Tokenizer::with_config(args.pattern, args.normalizer);
     let started = Instant::now();
-    tok.train(&text, args.vocab_size, args.verbose);
+    tok.train_from_reader(input, args.vocab_size, args.threads, args.verbose)
+        .map_err(read_error)?;
     let elapsed = started.elapsed();
 
     // Specials are registered AFTER training: their ids must sit above the learned
@@ -341,23 +388,47 @@ fn run_train(args: TrainArgs) -> Result<(), Box<dyn Error>> {
 
     // Re-encoding the corpus reproduces exactly what training ended with, because encode
     // applies merges in id order and ids were handed out in merge order.
-    // NOTE: this costs a full encode pass over the input. Cheap at 22 KB, not cheap at
-    // 1 GB — worth revisiting when the corpus gets real.
-    let ids = tok.encode_ordinary(&text);
+    //
+    // Read in blocks again, a second time from the top. Encoding block by block gives the
+    // same ids as encoding the whole, because blocks are cut only where the pre-tokenizer
+    // cuts; so the token count adds up, and the text round-trips iff every block does.
+    //
+    // This is a full encode pass over the input, single-threaded: measured at prod.2 as
+    // ~2 minutes per GB, against ~46 s to train on the same GB at vocab 300. On a
+    // production corpus it is days, hence `--no-report`. The model is already saved above,
+    // so skipping this loses nothing training produced.
+    let report = if args.report {
+        let input = fs::File::open(&args.input).map_err(read_error)?;
+        let (mut bytes, mut tokens, mut round_trips) = (0usize, 0usize, true);
+        tok.for_each_block(input, |block| {
+            let ids = tok.encode_ordinary(block);
+            bytes += block.len();
+            tokens += ids.len();
+            round_trips &= tok.decode(&ids).map_err(io::Error::other)? == block;
+            Ok(())
+        })
+        .map_err(read_error)?;
+        Some((bytes, tokens, round_trips))
+    } else {
+        None
+    };
     println!();
     println!("trained in:  {:.2}s", elapsed.as_secs_f64());
-    println!(
-        "compression: {} bytes -> {} tokens ({:.2}x)",
-        text.len(),
-        ids.len(),
-        text.len() as f64 / ids.len() as f64
-    );
-    // Under nfc/nfd this is expected to be false: normalization rewrites the text before
-    // encode ever sees it, so the original bytes are gone. Reported, never asserted.
-    println!(
-        "round trip:  {}",
-        if tok.decode(&ids)? == text { "ok" } else { "lossy (normalizer is not None)" }
-    );
+    if let Some((bytes, tokens, round_trips)) = report {
+        println!(
+            "compression: {} bytes -> {} tokens ({:.2}x)",
+            bytes,
+            tokens,
+            bytes as f64 / tokens as f64
+        );
+        // Under nfc/nfd this is expected to be false: normalization rewrites the text
+        // before encode ever sees it, so the original bytes are gone. Reported, never
+        // asserted.
+        println!(
+            "round trip:  {}",
+            if round_trips { "ok" } else { "lossy (normalizer is not None)" }
+        );
+    }
     println!("wrote:       {}.model, {}.vocab", args.out.display(), args.out.display());
 
     Ok(())
@@ -541,6 +612,30 @@ mod tests {
         assert_eq!(a.pattern, GPT4_SPLIT_PATTERN);
         assert_eq!(a.normalizer, Normalizer::None);
         assert!(!a.verbose);
+        assert!(a.report, "the report is on unless --no-report says otherwise");
+        assert_eq!(a.threads, default_threads());
+        assert!((1..=64).contains(&a.threads), "the default is all cores, at most 64");
+    }
+
+    #[test]
+    fn threads_is_taken_as_given_even_above_the_default_cap() {
+        let a = train_args(&[
+            "train", "--input", "c.txt", "--vocab-size", "300", "--out", "m", "--threads", "512",
+        ]);
+        assert_eq!(a.threads, 512);
+        for bad in ["0", "-1", "many"] {
+            let v = ["train", "--input", "c.txt", "--vocab-size", "300", "--out", "m", "--threads", bad];
+            assert!(parse_args(&args(&v)).is_err(), "--threads {bad} was accepted");
+        }
+    }
+
+    #[test]
+    fn no_report_turns_the_report_off() {
+        let a = train_args(&[
+            "train", "--input", "c.txt", "--vocab-size", "300", "--out", "m", "--no-report",
+        ]);
+        assert!(!a.report);
+        assert!(!a.verbose, "--no-report is its own flag, not a quieter --verbose");
     }
 
     #[test]

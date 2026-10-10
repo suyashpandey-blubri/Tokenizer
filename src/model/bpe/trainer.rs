@@ -32,9 +32,12 @@
 //! trainer/model split visible to callers is a step-13 decision.
 
 use std::collections::HashMap;
+use std::io::{self, Read};
+use std::sync::mpsc;
 use std::time::Instant;
 
 use crate::Tokenizer;
+use crate::text::pretokenizer::BLOCK_BYTES;
 use crate::model::bpe::model::{BYTE_ALPHABET, BpeModel, merge};
 use crate::model::bpe::pair_index::PairIndex;
 use crate::text::boundary::CorpusBoundaries;
@@ -177,6 +180,70 @@ impl BpeTrainer {
     }
 }
 
+/// Pre-tokenized chunks, DEDUPLICATED: each distinct chunk once, with how often it occurred.
+///
+/// Merges are applied within a chunk and never across one, so identical chunks can be
+/// collapsed. Natural text is enormously repetitive: 1 GB of English pre-tokenizes to
+/// roughly 200 million chunks but only ~1.6 million *distinct* ones, because `" the"` alone
+/// occurs tens of millions of times. Storing and re-processing every copy on every
+/// iteration is the same work done over and over for no new information.
+///
+/// THE KEYS ARE OWNED `String`s, NOT `&str` (prod.1)
+/// ------------------------------------------------
+/// Until prod.1 the tally was a `HashMap<&str, u64>` borrowing from the text, so no chunk
+/// was ever copied — but the whole text had to stay in memory until counting ended, and at
+/// 1.2 TB it cannot. Owning the keys lets the text arrive in blocks that are counted and
+/// dropped one at a time, so memory is set by the number of DISTINCT chunks, not by the
+/// size of the corpus. The cost is one copy of each distinct chunk.
+struct Tally {
+    counts: HashMap<String, u64>,
+    /// Every chunk seen, repeats included — for the verbose report only.
+    total: u64,
+}
+
+impl Tally {
+    fn new() -> Self {
+        Tally {
+            counts: HashMap::new(),
+            total: 0,
+        }
+    }
+
+    /// Normalize, pre-tokenize and count one piece of text. Called once with the whole
+    /// corpus by [`Tokenizer::train`], once per block by [`Tokenizer::train_from_reader`];
+    /// the two give the same tally because blocks are cut only where the pre-tokenizer
+    /// would cut anyway (see `last_safe_cut`).
+    fn add(&mut self, tok: &Tokenizer, text: &str) {
+        let text = tok.normalizer.normalize(text);
+        for chunk in tok.split(&text) {
+            // `get_mut` first, so a chunk already counted costs no allocation. `entry` would
+            // need an owned `String` key up front, copying every one of the 200 million.
+            match self.counts.get_mut(chunk) {
+                Some(count) => *count += 1,
+                None => {
+                    self.counts.insert(chunk.to_owned(), 1);
+                }
+            }
+            self.total += 1;
+        }
+    }
+
+    /// Add another tally's counts into this one. This is how the private tallies the
+    /// counting threads build are combined into the main one (prod.3). The keys are MOVED,
+    /// not copied: a chunk new to this tally takes the other tally's `String` as it is.
+    fn absorb(&mut self, other: Tally) {
+        for (chunk, count) in other.counts {
+            match self.counts.get_mut(&chunk) {
+                Some(mine) => *mine += count,
+                None => {
+                    self.counts.insert(chunk, count);
+                }
+            }
+        }
+        self.total += other.total;
+    }
+}
+
 impl Tokenizer {
     /// Train on `text`, replacing whatever this tokenizer had learned before.
     ///
@@ -189,29 +256,144 @@ impl Tokenizer {
         // the `vocab_size >= 256` assertion, so that still fires before any work is done.
         let trainer = BpeTrainer::new(vocab_size, verbose);
 
-        let text = self.normalizer.normalize(text);
+        // The whole text as ONE piece — never cut, so this gives the same chunks for any
+        // pattern, not only the two `train_from_reader` is proven for.
+        let mut tally = Tally::new();
+        tally.add(self, text);
+        self.train_on(trainer, tally, verbose);
+    }
 
-        // Pre-tokenize, then DEDUPLICATE. Merges are applied within a chunk and never
-        // across one, so no token can span a boundary — that part is unchanged. What is
-        // new is that identical chunks are collapsed.
-        //
-        // Natural text is enormously repetitive: 1 GB of English pre-tokenizes to roughly
-        // 200 million chunks but only ~3 million *distinct* ones, because `" the"` alone
-        // occurs tens of millions of times. Storing and re-processing every copy on every
-        // iteration is the same work done over and over for no new information.
-        //
-        // Tallying into a `HashMap<&str, u64>` borrows from `text`, so the chunk strings
-        // themselves are never copied — only counted.
-        let mut tally: HashMap<&str, u64> = HashMap::new();
-        let mut total_chunks: u64 = 0;
-        for chunk in self.split(&text) {
-            *tally.entry(chunk).or_insert(0) += 1;
-            total_chunks += 1;
+    /// Train on everything `reader` yields, without ever holding all of it in memory:
+    /// the input is read in ~64 MB blocks, each counted and dropped. Learns exactly what
+    /// [`train`](Tokenizer::train) would learn on the same text.
+    ///
+    /// Errors if the input is not valid UTF-8, if reading fails, or if this tokenizer's
+    /// pattern is not [`GPT4_SPLIT_PATTERN`](crate::GPT4_SPLIT_PATTERN) or
+    /// [`GPT2_SPLIT_PATTERN`](crate::GPT2_SPLIT_PATTERN) — the only two the block cut is
+    /// proven safe for. On an error nothing is learned and the old model is kept.
+    ///
+    /// `threads` is how many blocks are counted at the same time (0 is taken as 1). It
+    /// changes only speed and memory — the model learned is byte-identical for every value.
+    /// Learning the merges afterwards is single-threaded whatever it is.
+    pub fn train_from_reader<R: Read>(
+        &mut self,
+        reader: R,
+        vocab_size: u32,
+        threads: usize,
+        verbose: bool,
+    ) -> io::Result<()> {
+        self.train_from_reader_in_blocks(reader, vocab_size, threads, BLOCK_BYTES, verbose)
+    }
+
+    /// [`train_from_reader`](Tokenizer::train_from_reader) with the block size as a
+    /// parameter, so tests can use tiny blocks and get many batches out of a small text.
+    pub(crate) fn train_from_reader_in_blocks<R: Read>(
+        &mut self,
+        reader: R,
+        vocab_size: u32,
+        threads: usize,
+        block_bytes: usize,
+        verbose: bool,
+    ) -> io::Result<()> {
+        let trainer = BpeTrainer::new(vocab_size, verbose);
+        let tally = self.count_in_parallel(reader, threads.max(1), block_bytes)?;
+        self.train_on(trainer, tally, verbose);
+        Ok(())
+    }
+
+    /// PARALLEL COUNTING (prod.3) — the only place in the crate that uses threads, through
+    /// the `rayon` crate.
+    ///
+    /// Counting one block never needs anything from another block, and adding counts gives
+    /// the same total in any order, so blocks can be counted on different threads and the
+    /// result is exactly the tally one thread would have built. Learning the merges cannot
+    /// be split this way — each merge depends on the one before — and is untouched.
+    ///
+    /// HOW IT RUNS
+    /// -----------
+    /// `rayon` keeps a POOL of `threads` worker threads. The calling thread does not count;
+    /// it reads and combines:
+    ///
+    /// 1. it reads the next block and hands it to the pool as a TASK (`scope.spawn`). An
+    ///    idle worker picks it up and normalizes, splits and counts it into its OWN tally;
+    /// 2. a finished task sends its tally back over a channel (`mpsc`, a queue between
+    ///    threads in Rust's standard library);
+    /// 3. once `2 × threads` blocks are in flight, the calling thread waits for one tally,
+    ///    adds it into the main one (`absorb`), and only then reads another block. That cap
+    ///    is what bounds memory: about one block being counted per worker plus as many
+    ///    waiting, never the whole input.
+    ///
+    /// So reading, counting and combining all happen at the same time, on different threads.
+    ///
+    /// Why each task has a private tally rather than all of them sharing one: a shared table
+    /// can be changed by only one thread at a time, and each block holds ~12 million chunk
+    /// occurrences, so the workers would mostly wait on each other. Private tallies need no
+    /// coordination. Their cost is `absorb`, and a 64 MB block has only ~269,000 *distinct*
+    /// chunks, so combining is ~45× less work than counting (measured at prod.3).
+    ///
+    /// Why `rayon` and not `std::thread`: either would do this design. `rayon` is what
+    /// HuggingFace `tokenizers` and rustbpe use, it hands tasks to whichever worker is free,
+    /// and switching to `std::thread::scope` later would touch only this function.
+    fn count_in_parallel<R: Read>(
+        &self,
+        reader: R,
+        threads: usize,
+        block_bytes: usize,
+    ) -> io::Result<Tally> {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            // The single-threaded path ran the regex on the main thread, whose stack is
+            // 8 MB; a spawned thread's default is 2 MB. Matching it keeps the pre-tokenizer
+            // running under the same conditions it always has.
+            .stack_size(8 << 20)
+            .build()
+            .map_err(io::Error::other)?;
+        let (send, receive) = mpsc::channel::<Tally>();
+        let mut tally = Tally::new();
+        let mut in_flight = 0usize;
+
+        // `in_place_scope` runs this closure on the CALLING thread, and does not return
+        // until every task spawned inside it has finished — which is what lets each task
+        // borrow `self` (for the normalizer and pre-tokenizer) instead of copying it. If
+        // reading fails part-way, it still waits for the tasks already started.
+        let read = pool.in_place_scope(|scope| {
+            self.pattern.for_each_block(reader, block_bytes, |block| {
+                // The reader reuses its buffer, so the block is copied out to be handed to
+                // a task: ~10 ms per 64 MB, next to ~2 s to count it.
+                let block = block.to_owned();
+                let send = send.clone();
+                scope.spawn(move |_| {
+                    // ---- runs on a worker thread ----
+                    let mut mine = Tally::new();
+                    mine.add(self, &block);
+                    send.send(mine).expect("the receiver outlives every task");
+                });
+                in_flight += 1;
+                if in_flight == 2 * threads {
+                    tally.absorb(receive.recv().expect("a task is in flight"));
+                    in_flight -= 1;
+                }
+                Ok(())
+            })
+        });
+        read?;
+        // The scope has returned, so every task has finished and sent its tally; dropping
+        // the last sender lets the loop below end once the channel is empty.
+        drop(send);
+        for mine in receive {
+            tally.absorb(mine);
         }
+        Ok(tally)
+    }
 
+    /// Hand a finished tally to the trainer. Shared by both entry points, so everything
+    /// after counting is one code path.
+    fn train_on(&mut self, trainer: BpeTrainer, tally: Tally, verbose: bool) {
         // Two parallel vectors rather than a map of chunk -> count: `merge` rebuilds the
         // ids on every iteration, and rebuilding a HashMap's keys is far more expensive
         // than rewriting a Vec in place. `counts[i]` belongs to `chunks[i]`.
+        let total_chunks = tally.total;
+        let tally = tally.counts;
         let mut chunks: Vec<Vec<u32>> = Vec::with_capacity(tally.len());
         let mut counts: Vec<u64> = Vec::with_capacity(tally.len());
         for (chunk, count) in tally {
@@ -240,6 +422,27 @@ impl Tokenizer {
 mod tests {
     use super::*;
     use crate::text::boundary::Boundaries;
+
+    /// prod.3: the tally built by the worker threads is EXACTLY the one-thread tally —
+    /// every chunk's count, and the total. Compared directly rather than through the merges
+    /// they produce, because a counting error can leave the winning pairs unchanged on a
+    /// small text and still be wrong.
+    #[test]
+    fn parallel_counting_gives_the_tally_one_thread_gives() {
+        const CASES: &[&str] = include!("../../../tests/data/round_trip_cases.rs");
+        // ".\nx" puts a legal block cut after every case, so tiny blocks give many tasks.
+        let text: String = CASES.iter().map(|c| format!("{c}.\nx{c} \n")).collect();
+        let tok = Tokenizer::new();
+        let mut one = Tally::new();
+        one.add(&tok, &text);
+        for block_bytes in [7, 64, 1000] {
+            for threads in [1, 2, 3, 8] {
+                let many = tok.count_in_parallel(text.as_bytes(), threads, block_bytes).unwrap();
+                assert_eq!(many.counts, one.counts, "{block_bytes}-byte blocks, {threads} threads");
+                assert_eq!(many.total, one.total, "{block_bytes}-byte blocks, {threads} threads");
+            }
+        }
+    }
 
     /// THE LIVE-SEAM TEST for the training loop itself — added at 12.6, because the
     /// post-12.4b audit showed three mutations of this loop that no test noticed. Every

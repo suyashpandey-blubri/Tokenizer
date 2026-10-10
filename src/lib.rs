@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::io;
 
 mod model;
 mod special_tokens;
@@ -50,7 +51,7 @@ pub use text::pretokenizer::{GPT2_SPLIT_PATTERN, GPT4_SPLIT_PATTERN};
 // Plain `use`, because `PreTokenizer` is `pub(crate)`: only this file needs to name it,
 // as the type of a private field. `pub use` on it would not merely be redundant, it would
 // not compile — a `pub(crate)` item cannot be re-exported publicly.
-use text::pretokenizer::PreTokenizer;
+use text::pretokenizer::{BLOCK_BYTES, PreTokenizer};
 
 // Split the same two ways as above: `AllowedSpecial` (12.8a) is public API that `main.rs` and
 // `tests/api.rs` import by name, so it is re-exported; `SpecialTokens` (12.8b) is
@@ -157,6 +158,22 @@ impl Tokenizer {
     /// merge across.
     pub fn split<'a>(&self, text: &'a str) -> Vec<&'a str> {
         self.pattern.split(text)
+    }
+
+    /// Read `reader` to the end and call `f` on it in ~64 MB blocks of text, cut only where
+    /// this tokenizer's pre-tokenizer would cut anyway. Encoding the blocks one by one
+    /// therefore gives exactly the ids of encoding the whole input at once — which is how
+    /// a corpus larger than memory gets encoded. The same blocks
+    /// [`train_from_reader`](Tokenizer::train_from_reader) counts.
+    ///
+    /// Errors as `train_from_reader` does (invalid UTF-8, a read failure, a pattern other
+    /// than the two built-in ones), or with whatever `f` returns.
+    pub fn for_each_block<R: io::Read>(
+        &self,
+        reader: R,
+        f: impl FnMut(&str) -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.pattern.for_each_block(reader, BLOCK_BYTES, f)
     }
 
 
@@ -387,6 +404,118 @@ mod tests {
         for s in ROUND_TRIP_CASES {
             assert_eq!(Tokenizer::new().split(s).concat(), *s, "split lost data on {s:?}");
         }
+    }
+
+    // ---- prod.1: reading the input in blocks ----
+
+    /// Every round-trip case, three times over, joined so the text holds both kinds of `\n`:
+    /// ones a block may be cut after (`".\nx"`) and ones it may not (`" \n"`, `"\n\n"`).
+    fn text_with_cut_points() -> String {
+        ROUND_TRIP_CASES.iter().map(|c| format!("{c}.\nx{c} \n{c}\n\nx")).collect()
+    }
+
+    /// Everything the training tally sees, for the input in `block_bytes`
+    /// blocks: the normalized, pre-tokenized chunks of each block, end to end.
+    fn chunks_in_blocks(tok: &Tokenizer, text: &str, block_bytes: usize) -> Vec<String> {
+        let mut chunks = Vec::new();
+        tok.pattern
+            .for_each_block(text.as_bytes(), block_bytes, |block| {
+                let block = tok.normalizer.normalize(block);
+                chunks.extend(tok.split(&block).into_iter().map(String::from));
+                Ok(())
+            })
+            .unwrap();
+        chunks
+    }
+
+    #[test]
+    fn blocks_give_the_chunks_the_whole_text_gives() {
+        // THE prod.1 claim: cutting the input into blocks changes nothing training counts —
+        // for both built-in patterns, all three normalizers, and block sizes from one byte
+        // (a cut at every legal place) up to larger than the text (no cut at all).
+        let text = text_with_cut_points();
+        for pattern in [GPT4_SPLIT_PATTERN, GPT2_SPLIT_PATTERN] {
+            for normalizer in [Normalizer::None, Normalizer::Nfc, Normalizer::Nfd] {
+                let tok = Tokenizer::with_config(pattern, normalizer);
+                let whole: Vec<String> =
+                    tok.split(&tok.normalizer.normalize(&text)).into_iter().map(String::from).collect();
+                for block_bytes in [1, 7, 64, 1000, 1 << 20] {
+                    assert_eq!(
+                        chunks_in_blocks(&tok, &text, block_bytes),
+                        whole,
+                        "{} / {} / {block_bytes}-byte blocks",
+                        normalizer.name(),
+                        if pattern == GPT4_SPLIT_PATTERN { "gpt4" } else { "gpt2" },
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_block_is_cut_only_between_visible_ascii_around_a_newline() {
+        use crate::text::pretokenizer::last_safe_cut;
+        assert_eq!(last_safe_cut(b"a\nb c\nd"), Some(6), "the LAST legal cut, just after its \\n");
+        // Each of these is a `\n` that is not safe for GPT-2, and the reason the rule needs
+        // a visible character on BOTH sides (see `last_safe_cut`).
+        for unsafe_text in [&b"a \nb"[..], b"a\n\nb", b"a\r\nb", b"a\n b", b"\na", b"a\n"] {
+            assert_eq!(last_safe_cut(unsafe_text), None, "{:?}", String::from_utf8_lossy(unsafe_text));
+        }
+    }
+
+    #[test]
+    fn train_from_reader_learns_what_train_learns() {
+        // Through the public method (one block here, the text is small), and then with tiny
+        // blocks across thread counts — 3 does not divide the number of blocks, so the last
+        // batch is a partial one.
+        let text = text_with_cut_points();
+        for normalizer in [Normalizer::None, Normalizer::Nfc] {
+            let mut whole = Tokenizer::with_config(GPT4_SPLIT_PATTERN, normalizer);
+            whole.train(&text, 400, false);
+            let mut streamed = Tokenizer::with_config(GPT4_SPLIT_PATTERN, normalizer);
+            streamed.train_from_reader(text.as_bytes(), 400, 4, false).unwrap();
+            assert_eq!(streamed.model.merges_in_learned_order(), whole.model.merges_in_learned_order());
+            for threads in [1, 2, 3, 8] {
+                let mut blocked = Tokenizer::with_config(GPT4_SPLIT_PATTERN, normalizer);
+                blocked.train_from_reader_in_blocks(text.as_bytes(), 400, threads, 64, false).unwrap();
+                assert_eq!(
+                    blocked.model.merges_in_learned_order(),
+                    whole.model.merges_in_learned_order(),
+                    "{} / {threads} threads",
+                    normalizer.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reading_in_blocks_refuses_a_pattern_it_is_not_proven_for() {
+        // The cut rule is a claim about the two built-in patterns. Any other — here, one
+        // that only matches letters — gets an error, not a silently different tally.
+        let mut tok = Tokenizer::with_config(r"\p{L}+", Normalizer::None);
+        let e = tok.train_from_reader(&b"a\nb"[..], 300, 2, false).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+        assert!(tok.for_each_block(&b"a\nb"[..], |_| Ok(())).is_err());
+    }
+
+    #[test]
+    fn invalid_utf8_in_a_later_block_is_reported_at_its_byte_in_the_input() {
+        // Byte 5 is 0xFF, which never occurs in UTF-8. With 2-byte blocks the first block
+        // ("a.\n") is valid and counted before the bad one is reached, so the offset has
+        // to add up the blocks already handed on — 5, not its position within the block.
+        let tok = Tokenizer::new();
+        let e = tok
+            .pattern
+            .for_each_block(&b"a.\nb.\xFF\nc"[..], 2, |_| Ok(()))
+            .unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("at byte 5"), "{e}");
+
+        // And a failed read leaves what was learned before untouched.
+        let mut tok = trained();
+        let before = tok.model.merges_in_learned_order();
+        assert!(tok.train_from_reader(&b"a.\nb.\xFF\nc"[..], 300, 2, false).is_err());
+        assert_eq!(tok.model.merges_in_learned_order(), before);
     }
 
     #[test]

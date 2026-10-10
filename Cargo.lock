@@ -359,6 +359,7 @@ dependencies = [
  "criterion",
  "fancy-regex",
  "proptest",
+ "rayon",
  "unicode-normalization",
 ]
 

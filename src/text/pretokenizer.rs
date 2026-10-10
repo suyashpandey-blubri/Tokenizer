@@ -9,6 +9,8 @@
 //! are Unicode category *Mark*, not *Letter*, so today's pattern cuts every Indic word at
 //! every vowel sign and no downstream work can undo it.
 
+use std::io::{self, Read};
+
 use fancy_regex::Regex;
 
 // These need `fancy-regex`, not the std `regex` crate: `\s+(?!\S)` is a negative
@@ -74,4 +76,91 @@ impl PreTokenizer {
             .map(|m| m.expect("regex match failed").as_str())
             .collect()
     }
+
+    /// Read `reader` to the end and hand it to `f` in blocks of roughly `block_bytes`, each
+    /// cut at a [`last_safe_cut`] — so splitting the blocks one by one gives exactly the
+    /// chunks that splitting the whole input at once would. This is what lets training read
+    /// a corpus far larger than memory.
+    ///
+    /// Refuses any pattern but the two built-in ones, because the cut rule is a claim about
+    /// those two patterns and has been checked for nothing else.
+    ///
+    /// If a full buffer contains no safe cut, it grows by another block rather than cutting
+    /// unsafely. That is correct but unbounded: an input with no safe cut at all (no
+    /// newlines, or `\r\n` line endings throughout) is read whole, as before.
+    pub(crate) fn for_each_block<R: Read>(
+        &self,
+        mut reader: R,
+        block_bytes: usize,
+        mut f: impl FnMut(&str) -> io::Result<()>,
+    ) -> io::Result<()> {
+        if self.as_str() != GPT4_SPLIT_PATTERN && self.as_str() != GPT2_SPLIT_PATTERN {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "reading input in blocks is only proven safe for the gpt4 and gpt2 patterns",
+            ));
+        }
+        let mut buf: Vec<u8> = Vec::new();
+        // Bytes already handed to `f`, so a UTF-8 error can say where in the INPUT it is.
+        let mut consumed: u64 = 0;
+        loop {
+            // Top up by one block. `take(n).read_to_end` stops at n bytes or at the end of
+            // the input, so reading fewer than n means the end was reached.
+            let read = (&mut reader).take(block_bytes as u64).read_to_end(&mut buf)?;
+            let at_end = read < block_bytes;
+            let cut = if at_end {
+                buf.len()
+            } else {
+                match last_safe_cut(&buf) {
+                    Some(cut) => cut,
+                    None => continue, // no safe cut yet: grow the buffer
+                }
+            };
+            // A cut is always just after a `\n`, which is never part of a multi-byte
+            // character, so a valid file always gives valid blocks.
+            let block = std::str::from_utf8(&buf[..cut]).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("not valid UTF-8 (at byte {})", consumed + e.valid_up_to() as u64),
+                )
+            })?;
+            if !block.is_empty() {
+                f(block)?;
+            }
+            consumed += cut as u64;
+            buf.drain(..cut);
+            if at_end {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// The default for [`PreTokenizer::for_each_block`]: big enough that per-block overhead
+/// vanishes, small next to what the chunk tally itself holds.
+pub(crate) const BLOCK_BYTES: usize = 64 << 20;
+
+/// The last position in `bytes` where the input may be cut without changing what either
+/// built-in pattern produces: just after a `\n` whose neighbours on BOTH sides are visible
+/// ASCII (`!` to `~` — no space, no newline). `None` if there is no such position.
+///
+/// WHY BOTH SIDES
+/// --------------
+/// The obvious rule — "after a `\n` that is followed by a non-space" — is safe for GPT-4
+/// but NOT for GPT-2. GPT-2's `\s+(?!\S)` looks at the character after a run of spaces, and
+/// at the end of a block there is none: `"a \nb"` splits as `" "`, `"\n"` whole, but a block
+/// ending in `"a \n"` splits as `" \n"`. Measured (prod.1) on `book.txt`, `rust.txt` and
+/// 20 MB of fineweb with every cut applied at once: that rule changed the GPT-2 chunks on
+/// all three; this one left both patterns identical on all three.
+///
+/// A visible ASCII character after the cut also keeps NFC/NFD per block equal to NFC/NFD
+/// of the whole: it is never the second half of a composition, and the `\n` before the cut
+/// combines with nothing.
+pub(crate) fn last_safe_cut(bytes: &[u8]) -> Option<usize> {
+    (1..bytes.len().saturating_sub(1))
+        .rev()
+        .find(|&i| {
+            bytes[i] == b'\n' && bytes[i - 1].is_ascii_graphic() && bytes[i + 1].is_ascii_graphic()
+        })
+        .map(|i| i + 1)
 }

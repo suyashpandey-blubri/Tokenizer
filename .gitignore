@@ -10,3 +10,6 @@ __pycache__/
 # Step reports are analysis of the tokenizer, not part of how it works. Kept in the
 # working tree, deliberately never pushed.
 *_REPORT.md
+# Run folders from scripts/train_tokenizer.py: trained tokenizers, logs and run records.
+# Outputs of the code, not part of it.
+/runs/
